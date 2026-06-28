@@ -471,7 +471,8 @@ def build_app(cfg: Config) -> App:
         channel = event["channel"]
         msg_ts = event["ts"]
         is_dm = event.get("channel_type") == "im"
-        thread_ts = event.get("thread_ts") or (msg_ts if is_dm else None)
+        prior_dm = store.latest_for_channel_user(channel, user_id) if is_dm else None
+        thread_ts = event.get("thread_ts") or (prior_dm.thread_ts if prior_dm else None) or (msg_ts if is_dm else None)
         if not thread_ts:
             return  # non-DM messages are only continuations within an existing thread
 
