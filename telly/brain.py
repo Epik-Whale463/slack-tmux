@@ -90,7 +90,12 @@ def _system_prompt() -> str:
         "confirmation instead of proceeding silently. When you create a local file "
         "that should be shown in Slack, include a line exactly like "
         "`SLACK_UPLOAD: /absolute/path/to/file` in your final reply; telly will "
-        "upload it into the thread and hide that marker from the visible text.\n\n"
+        "upload it into the thread and hide that marker from the visible text. "
+        "When a Slack-native chart is useful, include a fenced "
+        "```slack-visualization JSON block containing one Slack "
+        "`data_visualization` block with the native `chart` payload. Supported "
+        "chart types are pie, bar, area, and line; telly will render the chart "
+        "natively and hide the JSON from the visible text.\n\n"
         f"Local coding CLIs available on this host:\n{_agents_block()}\n\n"
         f"{browser_capability_text()}"
     )

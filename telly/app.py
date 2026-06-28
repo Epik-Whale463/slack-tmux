@@ -255,7 +255,8 @@ def _format_upload_failure(path: Path, err: Exception) -> str:
 
 def _finalize_reply(client, channel: str, thread_ts: str, placeholder_ts: str | None, turn: brain.BrainTurn) -> None:
     reply, upload_paths = _extract_upload_markers(turn.reply)
-    text = slackfmt.to_mrkdwn(reply or "Uploaded requested file.")
+    reply, visualization_blocks = slackfmt.extract_visualization_blocks(reply)
+    text = slackfmt.to_mrkdwn(reply or ("Here's the visualization." if visualization_blocks else "Uploaded requested file."))
     if len(text) > LONG_REPLY_FILE_THRESHOLD and _try_upload_long_reply(client, channel, thread_ts, text):
         summary = "The answer was long, so I attached the full response as a Markdown file."
         actions_block = slackfmt.build_actions_block(thread_ts)
@@ -278,6 +279,7 @@ def _finalize_reply(client, channel: str, thread_ts: str, placeholder_ts: str | 
         first_chunk,
         completion_block=completion_block,
         breadcrumbs_block=breadcrumbs_block,
+        visualization_blocks=visualization_blocks,
         actions_block=actions_block if len(chunks) == 1 else None,
         feedback_block=feedback_block if len(chunks) == 1 else None,
         footer=footer_block if len(chunks) == 1 else None,

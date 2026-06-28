@@ -10,6 +10,7 @@ Slack's mrkdwn is NOT real Markdown:
 - code fences work, but a language tag (```python) renders as literal text
 """
 
+import json
 import re
 
 SLACK_MAX_TEXT = 2800   # section blocks cap text at 3000 chars; leave room for mrkdwn changes.
@@ -20,6 +21,10 @@ _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _STRIKE_RE = re.compile(r"~~([^~]+)~~")
 _BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
 _FENCE_LANG_RE = re.compile(r"^```([a-zA-Z0-9_+-]+)\s*$", re.MULTILINE)
+_VISUALIZATION_FENCE_RE = re.compile(
+    r"```(?:slack-visualization|slack_visualization|slack-data-visualization|slack_data_visualization)\s*\n(.*?)\n```",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def to_mrkdwn(text: str) -> str:
@@ -64,6 +69,249 @@ def chunk_for_slack(text: str, limit: int = SLACK_MAX_TEXT) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def extract_visualization_blocks(text: str) -> tuple[str, list[dict]]:
+    """Extract native Slack data_visualization blocks from fenced JSON.
+
+    Assistants can emit:
+    ```slack-visualization
+    {"type":"data_visualization", ...}
+    ```
+
+    Valid blocks are removed from visible text. Invalid fences are left intact so
+    the user can see and debug the payload instead of silently losing content.
+    """
+    blocks: list[dict] = []
+
+    def replace(match: re.Match) -> str:
+        try:
+            parsed = json.loads(match.group(1))
+            candidates = parsed if isinstance(parsed, list) else [parsed]
+            validated = [_validate_visualization_block(candidate) for candidate in candidates]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return match.group(0)
+        blocks.extend(validated)
+        return ""
+
+    cleaned = _VISUALIZATION_FENCE_RE.sub(replace, text).strip()
+    cleaned, raw_blocks = _extract_raw_visualization_json(cleaned)
+    blocks.extend(raw_blocks)
+    return cleaned, blocks
+
+
+def _extract_raw_visualization_json(text: str) -> tuple[str, list[dict]]:
+    blocks: list[dict] = []
+    spans: list[tuple[int, int]] = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(text):
+        start = text.find("{", idx)
+        if start == -1:
+            break
+        try:
+            parsed, end_offset = decoder.raw_decode(text[start:])
+            block = _validate_visualization_block(parsed)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            idx = start + 1
+            continue
+        blocks.append(block)
+        spans.append((start, start + end_offset))
+        idx = start + end_offset
+
+    if not spans:
+        return text, []
+    kept: list[str] = []
+    last = 0
+    for start, end in spans:
+        kept.append(text[last:start])
+        last = end
+    kept.append(text[last:])
+    cleaned = re.sub(r"\n{3,}", "\n\n", "".join(kept)).strip()
+    return cleaned, blocks
+
+
+def _validate_visualization_block(block: object) -> dict:
+    if not isinstance(block, dict) or block.get("type") != "data_visualization":
+        raise ValueError("expected data_visualization block")
+    block = _normalize_visualization_block(block)
+    title = _limit_text(block.get("title"), 50, "Visualization")
+    chart = block.get("chart")
+    if not isinstance(chart, dict):
+        raise ValueError("chart must be an object")
+
+    chart_type = chart.get("type")
+    if chart_type == "pie":
+        validated_chart = {"type": "pie", "segments": _validate_segments(chart.get("segments"))}
+    elif chart_type in {"bar", "area", "line"}:
+        categories = _validate_categories(((chart.get("axis_config") or {}).get("categories")))
+        validated_chart = {
+            "type": chart_type,
+            "series": _validate_series(chart.get("series"), categories),
+            "axis_config": _validate_axis_config(chart.get("axis_config"), categories),
+        }
+    else:
+        raise ValueError("unsupported chart type")
+
+    validated = {"type": "data_visualization", "title": title, "chart": validated_chart}
+    if block.get("block_id"):
+        validated["block_id"] = _safe_id(str(block["block_id"]))
+    return validated
+
+
+def _normalize_visualization_block(block: dict) -> dict:
+    chart = block.get("chart")
+    if isinstance(chart, dict) and "series" in chart and "axis_config" in chart:
+        return block
+
+    if isinstance(chart, dict) and chart.get("type") in {"line", "bar", "area"} and isinstance(chart.get("data"), list):
+        return _normalize_tabular_visualization(
+            block,
+            chart_type=chart.get("type"),
+            data=chart.get("data"),
+            x_key=chart.get("x"),
+            y_key=chart.get("y"),
+            title=block.get("title") or chart.get("title"),
+            x_label=chart.get("x_label") or chart.get("x"),
+            y_label=chart.get("y_label") or chart.get("y"),
+        )
+
+    chart_type = block.get("chart_type")
+    data = block.get("data")
+    if chart_type not in {"line", "bar", "area"} or not isinstance(data, list) or not data:
+        return block
+
+    return _normalize_tabular_visualization(
+        block,
+        chart_type=chart_type,
+        data=data,
+        x_key=None,
+        y_key=None,
+        title=block.get("title"),
+        x_label=block.get("x_axis"),
+        y_label=block.get("y_axis"),
+    )
+
+
+def _normalize_tabular_visualization(
+    block: dict,
+    *,
+    chart_type: str,
+    data: list,
+    x_key: object,
+    y_key: object,
+    title: object,
+    x_label: object,
+    y_label: object,
+) -> dict:
+    first = data[0]
+    if not isinstance(first, dict):
+        return block
+    x_key = str(x_key) if x_key else ("date" if "date" in first else next((k for k, v in first.items() if not isinstance(v, (int, float))), None))
+    y_key = str(y_key) if y_key else next((k for k, v in first.items() if k != x_key and isinstance(v, (int, float)) and not isinstance(v, bool)), None)
+    if not x_key or not y_key:
+        return block
+
+    points: list[dict] = []
+    categories: list[str] = []
+    for row in data[:20]:
+        if not isinstance(row, dict) or x_key not in row or y_key not in row:
+            continue
+        label = _limit_text(row[x_key], 20, "")
+        value = row[y_key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        categories.append(label)
+        points.append({"label": label, "value": value})
+    if not points:
+        return block
+
+    normalized = dict(block)
+    normalized["title"] = _limit_text(title, 50, "Visualization")
+    normalized["chart"] = {
+        "type": chart_type,
+        "series": [{"name": _limit_text(y_label or y_key, 20, "Series"), "data": points}],
+        "axis_config": {
+            "categories": categories,
+            "x_label": _limit_text(x_label or x_key, 50, ""),
+            "y_label": _limit_text(y_label or y_key, 50, ""),
+        },
+    }
+    return normalized
+
+
+def _limit_text(value: object, limit: int, fallback: str) -> str:
+    text = str(value or fallback).replace("\n", " ").strip()
+    return text[:limit] or fallback
+
+
+def _number(value: object) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("value must be numeric")
+    return value
+
+
+def _validate_segments(segments: object) -> list[dict]:
+    if not isinstance(segments, list) or not 1 <= len(segments) <= 6:
+        raise ValueError("pie segments must contain 1-6 items")
+    validated = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise ValueError("segment must be an object")
+        value = _number(segment.get("value"))
+        if value <= 0:
+            raise ValueError("pie segment value must be greater than 0")
+        validated.append({"label": _limit_text(segment.get("label"), 20, "Segment"), "value": value})
+    return validated
+
+
+def _validate_categories(categories: object) -> list[str]:
+    if not isinstance(categories, list) or not categories:
+        raise ValueError("categories must be a non-empty list")
+    return [_limit_text(category, 20, "Category") for category in categories[:20]]
+
+
+def _validate_axis_config(axis_config: object, categories: list[str]) -> dict:
+    if not isinstance(axis_config, dict):
+        raise ValueError("axis_config must be an object")
+    validated: dict = {"categories": categories}
+    if axis_config.get("x_label"):
+        validated["x_label"] = _limit_text(axis_config.get("x_label"), 50, "")
+    if axis_config.get("y_label"):
+        validated["y_label"] = _limit_text(axis_config.get("y_label"), 50, "")
+    return validated
+
+
+def _validate_series(series: object, categories: list[str]) -> list[dict]:
+    if not isinstance(series, list) or not 1 <= len(series) <= 6:
+        raise ValueError("series must contain 1-6 items")
+    category_set = set(categories)
+    names: set[str] = set()
+    validated = []
+    for item in series:
+        if not isinstance(item, dict):
+            raise ValueError("series item must be an object")
+        name = _limit_text(item.get("name"), 20, "Series")
+        if name in names:
+            raise ValueError("series names must be unique")
+        names.add(name)
+        data = item.get("data")
+        if not isinstance(data, list) or len(data) != len(categories):
+            raise ValueError("series data must match categories")
+        points = []
+        seen_labels: set[str] = set()
+        for point in data:
+            if not isinstance(point, dict):
+                raise ValueError("data point must be an object")
+            label = _limit_text(point.get("label"), 20, "")
+            if label not in category_set:
+                raise ValueError("data point label must match categories")
+            seen_labels.add(label)
+            points.append({"label": label, "value": _number(point.get("value"))})
+        if seen_labels != category_set:
+            raise ValueError("series must include every category")
+        validated.append({"name": name, "data": points})
+    return validated
 
 
 def build_footer_block(session_id: str | None, cost_usd: float | None, duration_ms: int | None) -> dict | None:
@@ -396,6 +644,7 @@ def build_blocks(
     *,
     completion_block: dict | None = None,
     breadcrumbs_block: dict | None = None,
+    visualization_blocks: list[dict] | None = None,
     footer: dict | None = None,
     actions_block: dict | None = None,
     feedback_block: dict | None = None,
@@ -407,6 +656,8 @@ def build_blocks(
     if breadcrumbs_block:
         blocks.append(breadcrumbs_block)
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": reply_chunk}, "expand": True})
+    if visualization_blocks:
+        blocks.extend(visualization_blocks[:8])
     if actions_block:
         blocks.append(actions_block)
     if feedback_block:
