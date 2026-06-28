@@ -80,6 +80,12 @@ class ThreadStore:
     def list_recent(self, limit: int = 20) -> list[ThreadState]:
         return sorted(self._threads.values(), key=lambda s: s.updated_at, reverse=True)[:limit]
 
+    def latest_for_channel_user(self, channel: str, user: str) -> ThreadState | None:
+        matches = [s for s in self._threads.values() if s.channel == channel and s.user == user and s.session_id]
+        if not matches:
+            return None
+        return max(matches, key=lambda s: s.updated_at)
+
     def session_map(self) -> dict[str, str]:
         return {k: v.session_id for k, v in self._threads.items() if v.session_id}
 
