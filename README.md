@@ -29,3 +29,9 @@ python -m telly.browser screenshot https://example.com --output page.png
 ```
 
 The browser helper uses a dedicated Chrome profile by default so normal Chrome sessions are not disturbed.
+
+## Slack Native Visualizations
+
+Telly can render Slack-native chart blocks from assistant replies.
+
+![Slack native visualization preview](slack-native-visualization-preview.png)
