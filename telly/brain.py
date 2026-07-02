@@ -1,17 +1,94 @@
 import json
 import logging
+import os
+import select
+import shutil
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
-from .browser import capability_text as browser_capability_text
+from .browser import capability_text as browser_capability_text, playwright_mcp_config
 from .discovery import discover_agents, format_for_brain
 
 log = logging.getLogger(__name__)
 
 AGENT_TURN_TIMEOUT_S = 600
+ProgressCallback = Callable[[dict], None]
+
+
+def _playwright_mcp_enabled() -> bool:
+    value = os.environ.get("TELLY_PLAYWRIGHT_MCP", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"} and shutil.which("npx") is not None
+
+
+def _opencode_ollama_model() -> str | None:
+    model = os.environ.get("OPENCODE_OLLAMA_MODEL", "").strip()
+    return model or None
+
+
+def _opencode_ollama_base_url() -> str:
+    return os.environ.get("OPENCODE_OLLAMA_BASE_URL", "http://localhost:11434/v1").strip() or "http://localhost:11434/v1"
+
+
+def _opencode_env_with_playwright_mcp() -> dict[str, str] | None:
+    if not _playwright_mcp_enabled() and not _opencode_ollama_model():
+        return None
+
+    env = os.environ.copy()
+    config = _merge_opencode_config_content(
+        env.get("OPENCODE_CONFIG_CONTENT"),
+        ollama_model=_opencode_ollama_model(),
+        ollama_base_url=_opencode_ollama_base_url(),
+    )
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+    return env
+
+
+def _merge_opencode_config_content(
+    existing: str | None,
+    *,
+    ollama_model: str | None = None,
+    ollama_base_url: str = "http://localhost:11434/v1",
+) -> dict:
+    if existing:
+        try:
+            config = json.loads(existing)
+            if not isinstance(config, dict):
+                config = {}
+        except json.JSONDecodeError:
+            log.warning("ignoring invalid OPENCODE_CONFIG_CONTENT while adding Playwright MCP")
+            config = {}
+    else:
+        config = {}
+
+    if _playwright_mcp_enabled():
+        mcp = config.get("mcp")
+        if not isinstance(mcp, dict):
+            mcp = {}
+            config["mcp"] = mcp
+        mcp.setdefault("playwright", playwright_mcp_config("opencode"))
+
+    if ollama_model:
+        provider = config.get("provider")
+        if not isinstance(provider, dict):
+            provider = {}
+            config["provider"] = provider
+        provider["ollama"] = {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "Ollama (local)",
+            "options": {"baseURL": ollama_base_url},
+            "models": {
+                ollama_model: {
+                    "name": ollama_model,
+                }
+            },
+        }
+        config["model"] = f"ollama/{ollama_model}"
+
+    return config
 
 
 class BrainCancelled(Exception):
@@ -134,10 +211,23 @@ def _build_cmd(agent_cmd: str, thread_ts: str, message: str) -> list[str]:
         "--permission-mode", "bypassPermissions",
         "--append-system-prompt", _system_prompt(),
     ]
+    if agent_name == "claude" and _playwright_mcp_enabled():
+        cmd += [
+            "--mcp-config",
+            json.dumps({"mcpServers": {"playwright": playwright_mcp_config("claude")}}, separators=(",", ":")),
+        ]
+    if agent_name == "claude":
+        cmd += ["--model", "claude-haiku-4-5-20251001"]
     if existing:
         cmd += ["--resume", existing]
     cmd.append(message)
     return cmd
+
+
+def _agent_env(agent_cmd: str) -> dict[str, str] | None:
+    if Path(agent_cmd).name == "opencode":
+        return _opencode_env_with_playwright_mcp()
+    return None
 
 
 def _log_turn(turn_log_path: Path, record: dict) -> None:
@@ -187,12 +277,14 @@ def _parse_event(event: dict, state: dict) -> None:
         text = str(part.get("text") or event.get("text") or "")
         if text.strip():
             state["assistant_texts"].append(text.strip())
+            state["partial_text"] = "\n\n".join(state["assistant_texts"]).strip()
 
     if etype == "assistant":
         msg = event.get("message") or {}
         text = _text_from_content(msg.get("content") or event.get("content"))
         if text.strip():
             state["assistant_texts"].append(text.strip())
+            state["partial_text"] = "\n\n".join(state["assistant_texts"]).strip()
         for block in msg.get("content") or []:
             if block.get("type") == "tool_use":
                 te = {
@@ -251,10 +343,11 @@ def _parse_event(event: dict, state: dict) -> None:
         )
         if text.strip():
             state["assistant_texts"].append(text.strip())
+            state["partial_text"] = "\n\n".join(state["assistant_texts"]).strip()
 
 
-def _parse_output(stdout: str, duration_ms: int) -> dict:
-    state: dict = {
+def _new_parse_state(duration_ms: int = 0) -> dict:
+    return {
         "reply": "",
         "session_id": None,
         "cost_usd": None,
@@ -262,7 +355,26 @@ def _parse_output(stdout: str, duration_ms: int) -> dict:
         "tool_breadcrumbs": [],
         "tool_events": [],
         "assistant_texts": [],
+        "partial_text": "",
     }
+
+
+def _parse_json_line(line: str, state: dict) -> bool:
+    try:
+        loaded = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+
+    parsed = False
+    for event in loaded if isinstance(loaded, list) else [loaded]:
+        if isinstance(event, dict):
+            _parse_event(event, state)
+            parsed = True
+    return parsed
+
+
+def _parse_output(stdout: str, duration_ms: int) -> dict:
+    state: dict = _new_parse_state(duration_ms)
 
     parsed_any = False
     stripped = stdout.strip()
@@ -290,7 +402,40 @@ def _parse_output(stdout: str, duration_ms: int) -> dict:
     return state
 
 
-def _run_agent(cmd: list[str], thread_ts: str) -> dict:
+def _agent_error_summary(stdout: str, stderr: str) -> str:
+    stderr = stderr.strip()
+    if stderr:
+        return stderr[-500:]
+
+    for line in reversed(stdout.strip().splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        error = event.get("error")
+        if isinstance(error, str) and error.strip():
+            return error.strip()[-500:]
+        if isinstance(error, dict):
+            data = error.get("data")
+            if isinstance(data, dict):
+                message = data.get("message")
+                if isinstance(message, str) and message.strip():
+                    return message.strip()[-500:]
+            message = error.get("message") or error.get("name")
+            if isinstance(message, str) and message.strip():
+                return message.strip()[-500:]
+
+    return stdout.strip()[-500:]
+
+
+def _run_agent(
+    cmd: list[str],
+    thread_ts: str,
+    env: dict[str, str] | None = None,
+    on_progress: ProgressCallback | None = None,
+) -> dict:
     started = time.monotonic()
     proc = subprocess.Popen(
         cmd,
@@ -298,28 +443,61 @@ def _run_agent(cmd: list[str], thread_ts: str) -> dict:
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=env,
     )
     assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    stderr_chunks: list[str] = []
+
+    def read_stderr() -> None:
+        try:
+            stderr_chunks.append(proc.stderr.read())
+        except Exception:
+            log.debug("agent stderr read failed", exc_info=True)
+
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stderr_thread.start()
 
     with _procs_mu:
         _thread_procs[thread_ts] = proc
 
     try:
-        try:
-            stdout, stderr = proc.communicate(timeout=AGENT_TURN_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            raise RuntimeError(f"agent timed out after {AGENT_TURN_TIMEOUT_S}s")
+        stdout_chunks: list[str] = []
+        progress_state = _new_parse_state()
+        while True:
+            if time.monotonic() - started > AGENT_TURN_TIMEOUT_S:
+                proc.kill()
+                raise RuntimeError(f"agent timed out after {AGENT_TURN_TIMEOUT_S}s")
+
+            readable, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if readable:
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                stdout_chunks.append(line)
+                if on_progress and _parse_json_line(line, progress_state):
+                    on_progress(progress_state)
+                continue
+
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+
+        rc = proc.wait(timeout=2)
+        stderr_thread.join(timeout=1)
+        stdout = "".join(stdout_chunks)
+        stderr = "".join(stderr_chunks)
 
         with _procs_mu:
             was_cancelled = thread_ts in _thread_cancelled
             _thread_cancelled.discard(thread_ts)
         if was_cancelled:
             raise BrainCancelled()
-        rc = proc.returncode
         if rc != 0:
-            raise RuntimeError(f"agent exited {rc}: {stderr.strip()[-500:]}")
+            raise RuntimeError(f"agent exited {rc}: {_agent_error_summary(stdout, stderr)}")
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -337,14 +515,16 @@ def ask_brain(
     thread_ts: str,
     message: str,
     turn_log_path: Path,
+    on_progress: ProgressCallback | None = None,
 ) -> BrainTurn:
     """Run one agent turn for a Slack thread. Returns a BrainTurn with reply + metadata."""
     with _lock_for(thread_ts):
         is_resume = thread_ts in _thread_sessions
         cmd = _build_cmd(agent_cmd, thread_ts, message)
+        env = _agent_env(agent_cmd)
         log.info("agent turn cmd=%s thread=%s resume=%s", Path(agent_cmd).name, thread_ts, is_resume)
 
-        state = _run_agent(cmd, thread_ts)
+        state = _run_agent(cmd, thread_ts, env=env, on_progress=on_progress)
 
         sid = state["session_id"]
         if sid:

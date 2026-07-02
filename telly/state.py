@@ -19,7 +19,38 @@ class ThreadState:
     cwd: str | None = None
     status: str = "idle"
     uploaded_files: list[str] = field(default_factory=list)
+    triggers: dict[str, dict[str, Any]] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.time)
+
+
+def _normalize_triggers(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for name, payload in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        key = name.strip()
+        if isinstance(payload, str):
+            normalized[key] = {
+                "instruction": payload,
+                "interval_seconds": None,
+                "enabled": False,
+                "next_run_at": None,
+            }
+            continue
+        if not isinstance(payload, dict):
+            continue
+        instruction = payload.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            continue
+        normalized[key] = {
+            "instruction": instruction.strip(),
+            "interval_seconds": payload.get("interval_seconds"),
+            "enabled": bool(payload.get("enabled", False)),
+            "next_run_at": payload.get("next_run_at"),
+        }
+    return normalized
 
 
 class ThreadStore:
@@ -38,9 +69,9 @@ class ThreadStore:
             threads = raw.get("threads", raw)
             for thread_ts, payload in threads.items():
                 if isinstance(payload, dict):
-                    self._threads[thread_ts] = ThreadState(thread_ts=thread_ts, **{
-                        k: v for k, v in payload.items() if k != "thread_ts"
-                    })
+                    state_payload = {k: v for k, v in payload.items() if k != "thread_ts"}
+                    state_payload["triggers"] = _normalize_triggers(state_payload.get("triggers"))
+                    self._threads[thread_ts] = ThreadState(thread_ts=thread_ts, **state_payload)
         except Exception:
             log.exception("thread state load failed")
 

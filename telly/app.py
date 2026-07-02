@@ -1,8 +1,10 @@
 import logging
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 from urllib.request import Request, urlopen
 
 from slack_bolt import App
@@ -17,8 +19,45 @@ log = logging.getLogger(__name__)
 MENTION_RE = re.compile(r"<@[UW][A-Z0-9]+>")
 NO_REPLY_TOKEN = "NO_REPLY"
 PROGRESS_PLACEHOLDER_TEXT = "telly is working..."
+PROGRESS_UPDATE_INTERVAL_S = 1.2
 LONG_REPLY_FILE_THRESHOLD = 9000
 UPLOAD_MARKER_RE = re.compile(r"^\s*(?:SLACK_UPLOAD|ATTACH_FILE):\s*(.+?)\s*$", re.MULTILINE)
+DISCUSSION_CONTEXT_RE = re.compile(
+    r"\b("
+    r"based on (our|the|this) discussion|"
+    r"based on (what|the things) we (discussed|said|talked about)|"
+    r"what do you think|"
+    r"where we landed|"
+    r"what did we decide|"
+    r"summari[sz]e (the )?(discussion|thread|conversation)|"
+    r"our discussion|"
+    r"the approach we discussed|"
+    r"what did <@[UW][A-Z0-9]+> mean|"
+    r"is this still blocked"
+    r")\b",
+    re.IGNORECASE,
+)
+TRIGGER_ADD_RE = re.compile(
+    r"^\s*(?:add|set)\s+trigger(?:\s+(?:named\s+)?)?\s+(?P<name>[^:\n=>]+?)\s*(?::|=>)\s*(?P<instruction>.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+TRIGGER_REMOVE_RE = re.compile(
+    r"^\s*(?:remove|delete)\s+trigger\s+(?P<name>.+?)\s*$",
+    re.IGNORECASE,
+)
+TRIGGER_START_RE = re.compile(
+    r"^\s*start\s+trigger\s+(?P<name>.+?)\s+every\s+(?P<interval>.+?)\s*$",
+    re.IGNORECASE,
+)
+TRIGGER_STOP_RE = re.compile(
+    r"^\s*stop\s+trigger\s+(?P<name>.+?)\s*$",
+    re.IGNORECASE,
+)
+TRIGGER_LIST_RE = re.compile(r"^\s*list\s+triggers\s*$", re.IGNORECASE)
+TRIGGER_CLEAR_RE = re.compile(r"^\s*clear\s+triggers\s*$", re.IGNORECASE)
+MAX_CONTEXT_MESSAGES = 30
+MAX_CONTEXT_TEXT_CHARS = 9000
+BACKGROUND_TRIGGER_POLL_INTERVAL_S = 2.0
 
 _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="telly-brain")
 
@@ -131,6 +170,262 @@ def _augment_prompt(text: str, file_paths: list[str], state_note: str | None = N
     return "\n\n".join(p for p in parts if p)
 
 
+def _format_trigger_note(triggers: dict[str, dict[str, Any]] | None) -> str | None:
+    if not triggers:
+        return None
+    lines = ["Live triggers active for this Slack thread. Apply them to this and future requests in this thread unless the user removes them:"]
+    for name, trigger in triggers.items():
+        if not isinstance(trigger, dict):
+            continue
+        instruction = str(trigger.get("instruction") or "").strip()
+        if not instruction:
+            continue
+        interval_seconds = trigger.get("interval_seconds")
+        enabled = bool(trigger.get("enabled"))
+        suffix = f" [running every {_format_interval_seconds(int(interval_seconds))}]" if enabled and isinstance(interval_seconds, (int, float)) else ""
+        lines.append(f"- {name}: {instruction}{suffix}")
+    return "\n".join(lines)
+
+
+def _normalize_trigger_name(name: str) -> str:
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def _parse_interval_seconds(text: str) -> int | None:
+    value = text.strip().lower()
+    match = re.fullmatch(r"(\d+)\s*([a-z]+)?", value)
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2) or "m"
+    if unit in {"s", "sec", "secs", "second", "seconds"}:
+        return amount
+    if unit in {"m", "min", "mins", "minute", "minutes"}:
+        return amount * 60
+    if unit in {"h", "hr", "hrs", "hour", "hours"}:
+        return amount * 3600
+    return None
+
+
+def _format_interval_seconds(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours}h"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+def _trigger_summary(name: str, trigger: dict[str, Any]) -> str:
+    instruction = str(trigger.get("instruction") or "").strip()
+    interval_seconds = trigger.get("interval_seconds")
+    enabled = bool(trigger.get("enabled"))
+    schedule = "manual"
+    if isinstance(interval_seconds, (int, float)):
+        schedule = f"every {_format_interval_seconds(int(interval_seconds))}"
+    status = "running" if enabled else "idle"
+    return f"- `{name}` [{status}; {schedule}]: {instruction}"
+
+
+def _handle_trigger_command(store: ThreadStore, client, channel: str, thread_ts: str, text: str) -> bool:
+    add_match = TRIGGER_ADD_RE.match(text)
+    if add_match:
+        name = _normalize_trigger_name(add_match.group("name"))
+        instruction = add_match.group("instruction").strip()
+        state = store.get(thread_ts)
+        triggers = dict(state.triggers if state else {})
+        previous = triggers.get(name) or {}
+        triggers[name] = {
+            "instruction": instruction,
+            "interval_seconds": previous.get("interval_seconds"),
+            "enabled": bool(previous.get("enabled", False)),
+            "next_run_at": previous.get("next_run_at"),
+        }
+        store.update(thread_ts, triggers=triggers)
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"Saved trigger `{name}` for this chat.")
+        return True
+
+    start_match = TRIGGER_START_RE.match(text)
+    if start_match:
+        name = _normalize_trigger_name(start_match.group("name"))
+        interval_seconds = _parse_interval_seconds(start_match.group("interval"))
+        if interval_seconds is None:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Could not parse the interval. Example: `start trigger amma jio every 5m`.")
+            return True
+        state = store.get(thread_ts)
+        triggers = dict(state.triggers if state else {})
+        trigger = dict(triggers.get(name) or {})
+        instruction = str(trigger.get("instruction") or "").strip()
+        if not instruction:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"No saved trigger named `{name}`. First add it with `add trigger {name}: ...`.")
+            return True
+        trigger["interval_seconds"] = interval_seconds
+        trigger["enabled"] = True
+        trigger["next_run_at"] = time.time()
+        triggers[name] = trigger
+        store.update(thread_ts, triggers=triggers)
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"Started trigger `{name}` every `{_format_interval_seconds(interval_seconds)}` for this chat.")
+        return True
+
+    remove_match = TRIGGER_REMOVE_RE.match(text)
+    if remove_match:
+        name = _normalize_trigger_name(remove_match.group("name"))
+        state = store.get(thread_ts)
+        triggers = dict(state.triggers if state else {})
+        if name in triggers:
+            del triggers[name]
+            store.update(thread_ts, triggers=triggers)
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"Removed trigger `{name}` from this chat.")
+        else:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"No trigger named `{name}` is active in this chat.")
+        return True
+
+    stop_match = TRIGGER_STOP_RE.match(text)
+    if stop_match:
+        name = _normalize_trigger_name(stop_match.group("name"))
+        state = store.get(thread_ts)
+        triggers = dict(state.triggers if state else {})
+        trigger = dict(triggers.get(name) or {})
+        instruction = str(trigger.get("instruction") or "").strip()
+        if not instruction:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"No trigger named `{name}` is saved in this chat.")
+            return True
+        trigger["enabled"] = False
+        trigger["next_run_at"] = None
+        triggers[name] = trigger
+        store.update(thread_ts, triggers=triggers)
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"Stopped trigger `{name}` for this chat.")
+        return True
+
+    if TRIGGER_LIST_RE.match(text):
+        state = store.get(thread_ts)
+        triggers = state.triggers if state else {}
+        if not triggers:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="No active triggers in this chat.")
+            return True
+        lines = [_trigger_summary(name, trigger) for name, trigger in triggers.items()]
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Active triggers in this chat:\n" + "\n".join(lines))
+        return True
+
+    if TRIGGER_CLEAR_RE.match(text):
+        store.update(thread_ts, triggers={})
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Cleared all triggers for this chat.")
+        return True
+
+    return False
+
+
+def _build_trigger_prompt(name: str, trigger: dict[str, Any]) -> str:
+    instruction = str(trigger.get("instruction") or "").strip()
+    return (
+        f"[Scheduled trigger: {name}] This trigger is running automatically in the background for this Slack thread.\n\n"
+        f"Trigger instruction:\n{instruction}\n\n"
+        f"Check now and act if needed. If there is nothing useful to report or do right now, reply with exactly {NO_REPLY_TOKEN}."
+    )
+
+
+def _run_due_triggers(cfg: Config, store: ThreadStore, client) -> None:
+    now = time.time()
+    for state in store.list_recent(999):
+        if not state.channel or not state.user or state.status in {"running", "queued"}:
+            continue
+        triggers = dict(state.triggers or {})
+        changed = False
+        for name, trigger in triggers.items():
+            if not isinstance(trigger, dict) or not trigger.get("enabled"):
+                continue
+            interval_seconds = trigger.get("interval_seconds")
+            next_run_at = trigger.get("next_run_at")
+            if not isinstance(interval_seconds, (int, float)):
+                continue
+            if isinstance(next_run_at, (int, float)) and next_run_at > now:
+                continue
+            trigger["next_run_at"] = now + int(interval_seconds)
+            changed = True
+            store.update(state.thread_ts, triggers=triggers, save=True)
+            prompt = _build_trigger_prompt(name, trigger)
+            _kickoff(cfg, store, client, state.channel, state.thread_ts, None, state.user, prompt, background=True)
+            break
+        if changed:
+            continue
+
+
+def _start_background_trigger_loop(cfg: Config, store: ThreadStore, client) -> None:
+    def worker() -> None:
+        while True:
+            try:
+                _run_due_triggers(cfg, store, client)
+            except Exception:
+                log.exception("background trigger loop failed")
+            time.sleep(BACKGROUND_TRIGGER_POLL_INTERVAL_S)
+
+    threading.Thread(target=worker, name="telly-trigger-loop", daemon=True).start()
+
+
+def _wants_discussion_context(text: str) -> bool:
+    return bool(DISCUSSION_CONTEXT_RE.search(text))
+
+
+def _slack_message_text(message: dict) -> str:
+    text = re.sub(r"\s+", " ", message.get("text", "") or "").strip()
+    files = message.get("files") or []
+    if files:
+        names = [f.get("name") or f.get("title") or f.get("id") for f in files]
+        text = (text + " " if text else "") + "[files: " + ", ".join(n for n in names if n) + "]"
+    return text
+
+
+def _format_context_messages(messages: list[dict], current_ts: str | None = None) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for msg in sorted(messages, key=lambda m: str(m.get("ts", ""))):
+        ts = str(msg.get("ts") or "")
+        if not ts or ts in seen:
+            continue
+        seen.add(ts)
+        text = _slack_message_text(msg)
+        if not text:
+            continue
+        speaker = msg.get("user") or msg.get("username") or msg.get("bot_id") or "unknown"
+        marker = " (current message)" if current_ts and ts == current_ts else ""
+        lines.append(f"- <@{speaker}>{marker}: {text}")
+    return lines
+
+
+def _fetch_discussion_context(client, channel: str, thread_ts: str, msg_ts: str | None) -> str | None:
+    messages: list[dict] = []
+    try:
+        replies = client.conversations_replies(channel=channel, ts=thread_ts, limit=MAX_CONTEXT_MESSAGES)
+        messages.extend(replies.get("messages", []) or [])
+    except Exception as e:
+        log.debug("thread context fetch failed: %s", e)
+
+    try:
+        history = client.conversations_history(
+            channel=channel,
+            latest=msg_ts or thread_ts,
+            inclusive=True,
+            limit=12,
+        )
+        messages.extend(history.get("messages", []) or [])
+    except Exception as e:
+        log.debug("channel context fetch failed: %s", e)
+
+    lines = _format_context_messages(messages, current_ts=msg_ts)
+    if not lines:
+        return None
+
+    body = "\n".join(lines)
+    if len(body) > MAX_CONTEXT_TEXT_CHARS:
+        body = body[-MAX_CONTEXT_TEXT_CHARS:]
+    return (
+        "Slack discussion context loaded because the user asked a context-dependent question. "
+        "Use it to answer based on the thread/channel discussion. If it is insufficient, ask one concise clarifying question.\n\n"
+        f"Channel: {channel}\nThread: {thread_ts}\nRecent discussion:\n{body}"
+    )
+
+
 def _post_placeholder(client, channel: str, thread_ts: str) -> str | None:
     try:
         resp = client.chat_postMessage(
@@ -153,6 +448,38 @@ def _post_placeholder(client, channel: str, thread_ts: str) -> str | None:
     except Exception:
         log.exception("placeholder fallback post failed")
         return None
+
+
+def _make_progress_callback(client, channel: str, thread_ts: str, placeholder_ts: str | None):
+    if not placeholder_ts:
+        return None
+
+    last_sent = 0.0
+    last_signature: tuple[int, str, str] | None = None
+    lock = threading.Lock()
+
+    def on_progress(state: dict) -> None:
+        nonlocal last_sent, last_signature
+        tool_events = state.get("tool_events") if isinstance(state.get("tool_events"), list) else []
+        partial_text = str(state.get("partial_text") or "")
+        signature = (len(tool_events), tool_events[-1].get("status", "") if tool_events else "", partial_text[-200:])
+        now = time.monotonic()
+        with lock:
+            if signature == last_signature or now - last_sent < PROGRESS_UPDATE_INTERVAL_S:
+                return
+            last_signature = signature
+            last_sent = now
+        try:
+            client.chat_update(
+                channel=channel,
+                ts=placeholder_ts,
+                text=PROGRESS_PLACEHOLDER_TEXT,
+                blocks=slackfmt.build_activity_blocks(thread_ts, tool_events, partial_text),
+            )
+        except Exception:
+            log.debug("progress chat.update failed", exc_info=True)
+
+    return on_progress
 
 
 def _post_or_update_final(
@@ -365,8 +692,9 @@ def _handle_brain_turn(
         brain.set_session_for_thread(thread_ts, prior.session_id)
     store.update(thread_ts, channel=channel, user=user_id, last_message=text, agent_cmd=cfg.main_agent_cmd, status="running")
     _set_status(client, channel, thread_ts, "Working on your request...")
+    on_progress = _make_progress_callback(client, channel, thread_ts, placeholder_ts)
     try:
-        turn = brain.ask_brain(cfg.main_agent_cmd, thread_ts, text, cfg.turn_log_path)
+        turn = brain.ask_brain(cfg.main_agent_cmd, thread_ts, text, cfg.turn_log_path, on_progress=on_progress)
     except brain.BrainCancelled:
         log.info("brain turn cancelled by user thread=%s", thread_ts)
         store.update(thread_ts, status="cancelled")
@@ -404,10 +732,13 @@ def _handle_brain_turn(
     _finalize_reply(client, channel, thread_ts, placeholder_ts, turn)
 
 
-def _kickoff(cfg: Config, store: ThreadStore, client, channel: str, thread_ts: str, msg_ts: str | None, user_id: str, text: str, file_paths: list[str] | None = None) -> None:
+def _kickoff(cfg: Config, store: ThreadStore, client, channel: str, thread_ts: str, msg_ts: str | None, user_id: str, text: str, file_paths: list[str] | None = None, background: bool = False) -> None:
     if msg_ts:
         _swap_reaction(client, channel, msg_ts, None, "hourglass_flowing_sand")
-    prompt = _augment_prompt(text, file_paths or [])
+    context_note = _fetch_discussion_context(client, channel, thread_ts, msg_ts) if _wants_discussion_context(text) else None
+    state = store.get(thread_ts)
+    trigger_note = _format_trigger_note(state.triggers if state else None)
+    prompt = _augment_prompt(text, file_paths or [], "\n\n".join(note for note in [context_note, trigger_note] if note))
     store.update(
         thread_ts,
         channel=channel,
@@ -418,7 +749,7 @@ def _kickoff(cfg: Config, store: ThreadStore, client, channel: str, thread_ts: s
         status="queued",
     )
     _set_title(client, channel, thread_ts, text)
-    placeholder_ts = _post_placeholder(client, channel, thread_ts)
+    placeholder_ts = None if background else _post_placeholder(client, channel, thread_ts)
     _executor.submit(_handle_brain_turn, cfg, store, client, channel, thread_ts, msg_ts, user_id, prompt, placeholder_ts)
 
 
@@ -426,6 +757,7 @@ def build_app(cfg: Config) -> App:
     app = App(token=cfg.slack_bot_token, signing_secret=cfg.slack_signing_secret)
     store = ThreadStore(cfg.telly_home)
     brain.restore_sessions(store.session_map())
+    _start_background_trigger_loop(cfg, store, app.client)
 
     def _allowed(user_id: str) -> bool:
         return not cfg.allowed_slack_user_ids or user_id in cfg.allowed_slack_user_ids
@@ -446,6 +778,9 @@ def build_app(cfg: Config) -> App:
             return
         if not text:
             client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="(say something after the mention)")
+            return
+
+        if _handle_trigger_command(store, client, channel, thread_ts, text):
             return
 
         file_paths = _download_slack_files(cfg, event)
@@ -489,6 +824,8 @@ def build_app(cfg: Config) -> App:
             return
 
         clean = _strip_mentions(text)
+        if _handle_trigger_command(store, client, channel, thread_ts, clean):
+            return
         file_paths = _download_slack_files(cfg, event)
         log.info("thread continuation from %s in %s thread=%s: %s", user_id, channel, thread_ts, clean[:120])
         _kickoff(cfg, store, client, channel, thread_ts, msg_ts, user_id, clean, file_paths)

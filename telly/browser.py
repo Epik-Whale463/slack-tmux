@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,8 +16,41 @@ from urllib.parse import urlparse
 DEFAULT_TIMEOUT_S = 45
 DEFAULT_VIEWPORT = "1440,1000"
 DEFAULT_TEXT_LIMIT = 20000
+SESSION_ROOT_DIR = "~/.telly/browser-sessions"
+DEFAULT_SESSION_NAME = "default"
 DEFAULT_PROFILE_DIR = "~/.telly/chrome-profile"
 DEFAULT_CHROME_PROFILE_NAME = "Default"
+MCP_OUTPUT_DIR = "~/.telly/playwright-mcp"
+PROFILE_LOCK_FILES = ("SingletonLock", "SingletonCookie")
+SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def playwright_mcp_config(client: str) -> dict:
+    """Return a Playwright MCP config block for the target agent client."""
+    profile = str(_default_profile_dir())
+    output_dir = str(Path(MCP_OUTPUT_DIR).expanduser().resolve())
+    args = [
+        "-y",
+        "@playwright/mcp@latest",
+        "--browser=chrome",
+        f"--user-data-dir={profile}",
+        f"--output-dir={output_dir}",
+        "--caps=pdf,devtools",
+        "--headless",
+    ]
+
+    if client == "opencode":
+        return {
+            "type": "local",
+            "command": ["npx", *args],
+            "enabled": True,
+            "timeout": 10000,
+        }
+
+    return {
+        "command": "npx",
+        "args": args,
+    }
 
 
 class BrowserError(RuntimeError):
@@ -41,17 +75,19 @@ def capability_text() -> str:
     py = sys.executable
     profile = _default_profile_dir()
     automation = "Playwright automation is installed" if _has_playwright() else "Chrome capture fallback is available"
+    mcp = "Playwright MCP is injected into spawned Claude/OpenCode turns" if shutil.which("npx") else "Playwright MCP unavailable; `npx` not found"
     return (
-        f"Browser automation available via local Chrome ({automation}). It reuses telly's dedicated profile `{profile}` by default, so the user can keep normal Chrome open. Use these commands when a Slack task needs rendered web pages:\n"
-        f"- `{py} -m telly.browser text URL` for readable rendered page text\n"
-        f"- `{py} -m telly.browser dom URL` for rendered HTML/DOM\n"
-        f"- `{py} -m telly.browser metadata URL` for title, final URL, and text summary\n"
-        f"- `{py} -m telly.browser screenshot URL --output PATH.png` for a screenshot\n"
-        f"- `{py} -m telly.browser pdf URL --output PATH.pdf` for a PDF capture\n"
-        f"- `{py} -m telly.browser script URL --steps '[{{\"action\":\"fill\",\"selector\":\"input[name=q]\",\"text\":\"query\"}},{{\"action\":\"press\",\"selector\":\"input[name=q]\",\"key\":\"Enter\"}},{{\"action\":\"text\"}}]'` for clicks, forms, waits, screenshots, PDFs, and JS evaluation\n"
-        f"For login/CAPTCHA, run with `--headed --profile {DEFAULT_PROFILE_DIR}`, ask the user to complete the browser challenge, then retry normally; cookies/session remain saved in that profile. "
-        "Useful flags: `--headed` to show Chrome, `--profile PATH` to choose a Chrome user-data directory, `--profile-name NAME` to choose Default/Profile 1/etc, `--ephemeral` for a fresh throwaway browser, `--wait-ms 3000`, `--viewport 390,844` for mobile, `--user-agent VALUE`, `--timeout 60`. "
-        "Use the default telly profile first; use `--storage-state PATH.json` with `script --ephemeral` only for explicit Playwright state files. "
+        f"Browser automation available via local Chrome ({automation}; {mcp}). Never use the user's normal Chrome profile unless explicitly asked. For each browser job, choose a descriptive persistent session name such as `linkedin`, `whatsapp`, or `gmail`, and keep all work for that site in that named telly session under `{_session_root_dir()}`. Use Playwright MCP first only for interactive debugging in the default telly session `{profile}`; for reusable authenticated site work, prefer the `telly.browser` CLI with `--session NAME`.\n"
+        f"- `{py} -m telly.browser --session linkedin text URL` for readable rendered page text in the `linkedin` session\n"
+        f"- `{py} -m telly.browser --session linkedin dom URL` for rendered HTML/DOM\n"
+        f"- `{py} -m telly.browser --session linkedin metadata URL` for title, final URL, and text summary\n"
+        f"- `{py} -m telly.browser --session linkedin screenshot URL --output PATH.png` for a screenshot\n"
+        f"- `{py} -m telly.browser --session linkedin pdf URL --output PATH.pdf` for a PDF capture\n"
+        f"- `{py} -m telly.browser --session linkedin script URL --steps '[{{\"action\":\"fill\",\"selector\":\"input[name=q]\",\"text\":\"query\"}},{{\"action\":\"press\",\"selector\":\"input[name=q]\",\"key\":\"Enter\"}},{{\"action\":\"text\"}}]'` for clicks, forms, waits, screenshots, PDFs, and JS evaluation\n"
+        f"- `{py} -m telly.browser sessions` to list saved named sessions\n"
+        f"For login/CAPTCHA, run `--headed --session SESSION login URL --success-url REGEX`; the login helper closes after success and saves the browser state in that named session for future Slack chats. "
+        "Useful flags: `--session NAME` for a named telly browser session, `--headed` to show Chrome, `--profile PATH` only for an explicit Chrome user-data directory escape hatch, `--profile-name NAME` to choose Default/Profile 1/etc, `--ephemeral` for a fresh throwaway browser, `--wait-ms 3000`, `--viewport 390,844` for mobile, `--user-agent VALUE`, `--timeout 60`. "
+        "Use `--storage-state PATH.json` with `script --ephemeral` only for explicit Playwright state files. "
         "To show screenshots/PDFs in Slack, include `SLACK_UPLOAD: /absolute/path` in the final reply."
     )
 
@@ -75,14 +111,72 @@ def _default_profile_dir() -> Path:
     env_profile = os.environ.get("TELLY_BROWSER_PROFILE")
     if env_profile:
         return Path(env_profile).expanduser().resolve()
-    return Path(DEFAULT_PROFILE_DIR).expanduser().resolve()
+    return _session_profile_dir(os.environ.get("TELLY_BROWSER_SESSION", DEFAULT_SESSION_NAME))
+
+
+def _session_root_dir() -> Path:
+    return Path(os.environ.get("TELLY_BROWSER_SESSION_ROOT", SESSION_ROOT_DIR)).expanduser().resolve()
+
+
+def _validate_session_name(name: str) -> str:
+    name = name.strip()
+    if not SESSION_NAME_RE.fullmatch(name):
+        raise BrowserError("session name must be 1-64 chars: letters, numbers, dot, underscore, or hyphen")
+    if name in {".", ".."}:
+        raise BrowserError("session name cannot be . or ..")
+    return name
+
+
+def _session_profile_dir(name: str) -> Path:
+    return (_session_root_dir() / _validate_session_name(name)).resolve()
 
 
 def _profile_dir(args: argparse.Namespace) -> Path | None:
     if getattr(args, "ephemeral", False):
         return None
     profile = getattr(args, "profile", "")
+    session = getattr(args, "session", "")
+    if profile and session:
+        raise BrowserError("use either --profile PATH or --session NAME, not both")
+    if session:
+        return _session_profile_dir(session)
+    profile = getattr(args, "profile", "")
     return Path(profile).expanduser().resolve() if profile else _default_profile_dir()
+
+
+def _list_sessions() -> list[dict[str, str | bool]]:
+    root = _session_root_dir()
+    if not root.exists():
+        return []
+    sessions = []
+    for path in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not path.is_dir() or not SESSION_NAME_RE.fullmatch(path.name):
+            continue
+        sessions.append({
+            "name": path.name,
+            "path": str(path),
+            "active": _profile_lock_path(path) is not None,
+        })
+    return sessions
+
+
+def _profile_lock_path(profile: Path) -> Path | None:
+    for name in PROFILE_LOCK_FILES:
+        lock = profile / name
+        if lock.exists() or lock.is_symlink():
+            return lock
+    return None
+
+
+def _ensure_profile_available(profile: Path) -> None:
+    lock = _profile_lock_path(profile)
+    if lock is None:
+        return
+    raise BrowserError(
+        f"Chrome profile is already in use: {profile}. "
+        "Reuse the active browser session and open a new tab, or pass --ephemeral/--profile for a separate session. "
+        f"Lock file: {lock}"
+    )
 
 
 @contextmanager
@@ -90,6 +184,7 @@ def _chrome_user_data_dir(args: argparse.Namespace):
     profile = _profile_dir(args)
     if profile is not None:
         profile.mkdir(parents=True, exist_ok=True)
+        _ensure_profile_available(profile)
         yield str(profile)
         return
     with tempfile.TemporaryDirectory(prefix="telly-chrome-") as tmp:
@@ -197,6 +292,7 @@ def _playwright_context(args: argparse.Namespace):
     profile = _profile_dir(args)
     if profile is not None:
         profile.mkdir(parents=True, exist_ok=True)
+        _ensure_profile_available(profile)
         launch_args = []
         if getattr(args, "profile_name", ""):
             launch_args.append(f"--profile-directory={args.profile_name}")
@@ -332,13 +428,60 @@ def _run_script(url: str, args: argparse.Namespace) -> dict:
         pw.stop()
 
 
+def _login_success(page, args: argparse.Namespace, start_url: str) -> tuple[bool, str]:
+    if args.success_url and re.search(args.success_url, page.url):
+        return True, "success_url"
+    if args.success_text:
+        text = page.locator("body").inner_text(timeout=1000)
+        if args.success_text.lower() in text.lower():
+            return True, "success_text"
+    if not args.success_url and not args.success_text and page.url != start_url:
+        parsed = urlparse(page.url)
+        login_markers = ("login", "signin", "sign-in", "checkpoint", "challenge", "uas")
+        haystack = f"{parsed.path}?{parsed.query}".lower()
+        if not any(marker in haystack for marker in login_markers):
+            return True, "url_changed_off_login"
+    return False, ""
+
+
+def _wait_for_login(url: str, args: argparse.Namespace) -> dict:
+    _validate_url(url)
+    pw, browser, context, page = _playwright_context(args)
+    try:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=args.timeout * 1000)
+            start_url = page.url
+            deadline = time.monotonic() + args.timeout
+            last_url = page.url
+            while time.monotonic() < deadline:
+                ok, reason = _login_success(page, args, start_url)
+                if ok:
+                    return {"authenticated": True, "reason": reason, "url": page.url, "title": page.title()}
+                last_url = page.url
+                page.wait_for_timeout(args.poll_ms)
+            return {"authenticated": False, "reason": "timeout", "url": last_url, "title": page.title()}
+        except Exception as e:
+            if "closed" in str(e).lower():
+                return {"authenticated": False, "reason": "browser_closed", "url": "", "title": ""}
+            raise
+    finally:
+        if args.storage_state:
+            Path(args.storage_state).expanduser().parent.mkdir(parents=True, exist_ok=True)
+            context.storage_state(path=str(Path(args.storage_state).expanduser()))
+        context.close()
+        if browser is not None:
+            browser.close()
+        pw.stop()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Use local headless Chrome for browser tasks.")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S, help="Chrome timeout in seconds")
     parser.add_argument("--wait-ms", type=int, default=3000, help="virtual time budget for JS/network settling")
     parser.add_argument("--viewport", default=DEFAULT_VIEWPORT, help="viewport/window size, e.g. 1440,1000")
     parser.add_argument("--user-agent", default="", help="override browser user agent")
-    parser.add_argument("--profile", default="", help="persistent Chrome user-data directory; defaults to your real Chrome profile if found")
+    parser.add_argument("--session", default="", help="named persistent telly browser session, e.g. linkedin or whatsapp")
+    parser.add_argument("--profile", default="", help="persistent Chrome user-data directory; defaults to telly's dedicated profile")
     parser.add_argument("--profile-name", default=DEFAULT_CHROME_PROFILE_NAME, help="Chrome profile directory name inside user-data dir, e.g. Default or 'Profile 1'")
     parser.add_argument("--ephemeral", action="store_true", help="use a fresh temporary browser profile")
     parser.add_argument("--headed", action="store_true", help="show Chrome so the user can solve CAPTCHA/login manually")
@@ -362,6 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
     script.add_argument("--steps", help="JSON array of automation steps")
     script.add_argument("--steps-file", help="path to JSON array of automation steps")
     script.add_argument("--storage-state", default="", help="cookies/local storage JSON path for this script")
+    login = sub.add_parser("login")
+    login.add_argument("url")
+    login.add_argument("--success-url", default="", help="regex that must match the authenticated page URL")
+    login.add_argument("--success-text", default="", help="text that must appear on the authenticated page")
+    login.add_argument("--poll-ms", type=int, default=1000, help="how often to check authentication state")
+    sub.add_parser("sessions")
     sub.add_parser("capabilities")
     return parser
 
@@ -372,6 +521,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "capabilities":
             print(capability_text())
+            return 0
+        if args.command == "sessions":
+            print(json.dumps({"root": str(_session_root_dir()), "sessions": _list_sessions()}, indent=2))
             return 0
         if args.command == "dom":
             print(_dump_dom_best(args.url, args), end="")
@@ -396,6 +548,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "script":
             print(json.dumps(_run_script(args.url, args), indent=2))
             return 0
+        if args.command == "login":
+            result = _wait_for_login(args.url, args)
+            print(json.dumps(result, indent=2))
+            return 0 if result["authenticated"] else 3
     except BrowserError as e:
         print(f"browser error: {e}", file=sys.stderr)
         return 2
