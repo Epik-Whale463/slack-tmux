@@ -428,6 +428,76 @@ _TOOL_ICONS = {
     "Bash": ":zap:",
 }
 
+
+def _phase_for_tool(name: str, status: str) -> tuple[str, str]:
+    if status == "done":
+        return ":white_check_mark:", "wrapping up"
+    if name in {"Read", "Glob", "Grep"}:
+        return ":mag:", "searching workspace"
+    if name in {"Edit", "Write", "NotebookEdit"}:
+        return ":pencil2:", "editing files"
+    if name in {"WebFetch", "WebSearch"} or name.startswith("playwright_browser"):
+        return ":globe_with_meridians:", "using browser"
+    if name == "Task":
+        return ":robot_face:", "delegating to sub-agent"
+    if name == "Bash":
+        return ":zap:", "running command"
+    return ":gear:", "using tools"
+
+
+def build_activity_blocks(thread_ts: str, tool_events: list[dict] | None = None, partial_text: str = "") -> list[dict]:
+    """Build the in-flight Slack agent card with live activity details."""
+    events = tool_events or []
+    current = next((event for event in reversed(events) if event.get("status") == "running"), None)
+    current = current or (events[-1] if events else None)
+    phase_icon, phase = _phase_for_tool(current.get("name", "") if current else "", current.get("status", "") if current else "")
+    if not current and partial_text:
+        phase_icon, phase = ":speech_balloon:", "drafting reply"
+    elif not current:
+        phase_icon, phase = ":hourglass_flowing_sand:", "starting"
+
+    rows: list[str] = []
+    for event in events[-6:]:
+        name = str(event.get("name") or "tool")
+        tool_input = event.get("input") if isinstance(event.get("input"), dict) else {}
+        icon = _status_marker(str(event.get("status") or "running"), _tool_icon(name, tool_input))
+        rows.append(f"{icon} {format_breadcrumb(name, tool_input)}")
+    if not rows:
+        rows.append(":small_blue_diamond: Preparing the local agent and workspace.")
+
+    details = "\n".join([f"{phase_icon} {phase}", *rows])
+    if partial_text.strip():
+        details = details + "\n\n" + _truncate(to_mrkdwn(partial_text.strip())[-1200:], 1200)
+
+    sid = _safe_id(thread_ts)
+    return [
+        {
+            "type": "plan",
+            "block_id": f"telly_plan_{sid}",
+            "title": "Working on your request",
+            "tasks": [
+                {
+                    "task_id": f"{sid}_understand",
+                    "title": "Understand the Slack request",
+                    "status": "complete",
+                    "output": _rich_text("Thread context received."),
+                },
+                {
+                    "task_id": f"{sid}_work",
+                    "title": f"{phase_icon} {phase}",
+                    "status": "in_progress",
+                    "details": _rich_text(details),
+                },
+                {
+                    "task_id": f"{sid}_answer",
+                    "title": "Post the complete answer",
+                    "status": "pending",
+                },
+            ],
+        },
+        build_stop_actions_block(thread_ts),
+    ]
+
 def _safe_id(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", value)[:80]
 
@@ -461,39 +531,8 @@ def _status_marker(status: str, icon: str) -> str:
 
 
 def build_loading_blocks(thread_ts: str) -> list[dict]:
-    """Agent-style loading UI using Slack's plan and task_card blocks."""
-    sid = _safe_id(thread_ts)
-    return [
-        {
-            "type": "plan",
-            "block_id": f"telly_plan_{sid}",
-            "title": "Working on your request",
-            "tasks": [
-                {
-                    "task_id": f"{sid}_understand",
-                    "title": "Understand the Slack request",
-                    "status": "complete",
-                    "output": _rich_text("Thread context received."),
-                },
-                {
-                    "task_id": f"{sid}_work",
-                    "title": "Use local workspace and tools",
-                    "status": "in_progress",
-                    "details": _rich_text("Reading context and running the agent without streaming partial text."),
-                },
-                {
-                    "task_id": f"{sid}_answer",
-                    "title": "Post the complete answer",
-                    "status": "pending",
-                },
-            ],
-        },
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": "No token streaming. This card will be replaced with the full response."}],
-        },
-        build_stop_actions_block(thread_ts),
-    ]
+    """Initial in-flight UI before agent events arrive."""
+    return build_activity_blocks(thread_ts)
 
 
 def build_plain_loading_blocks(thread_ts: str) -> list[dict]:

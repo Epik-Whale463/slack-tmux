@@ -35,6 +35,20 @@ class SlackFormatTest(unittest.TestCase):
         self.assertEqual(blocks[1], visualization)
         self.assertEqual(blocks[2]["type"], "actions")
 
+    def test_activity_blocks_show_phase_tool_and_partial_reply(self):
+        blocks = slackfmt.build_activity_blocks(
+            "123.456",
+            [{"name": "Edit", "input": {"file_path": "/tmp/app.py"}, "status": "running"}],
+            "Drafting answer",
+        )
+
+        rendered = str(blocks)
+        self.assertEqual(blocks[0]["type"], "plan")
+        self.assertIn("editing files", rendered)
+        self.assertIn("edit `/tmp/app.py`", rendered)
+        self.assertIn("Drafting answer", rendered)
+        self.assertEqual(blocks[-1]["type"], "actions")
+
 
 if __name__ == "__main__":
     unittest.main()
