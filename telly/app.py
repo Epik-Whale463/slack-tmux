@@ -2,6 +2,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from . import brain, slackfmt
 from .config import Config
 from .state import ThreadStore
+from .video_stream import get_stream_server, VideoStreamSession, PLAYWRIGHT_OUTPUT_DIR, STREAM_HOST, STREAM_PORT
 
 log = logging.getLogger(__name__)
 
@@ -683,6 +685,30 @@ def _finalize_error(client, channel: str, thread_ts: str, placeholder_ts: str | 
         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=fallback_blocks)
 
 
+def _is_browser_task(text: str) -> bool:
+    """Detect if the prompt likely involves browser automation."""
+    keywords = (
+        "browser", "navigate", "visit", "screenshot", "click", "fill", "form",
+        "web", "page", "link", "url", "scrape", "automat", "interact", "submit"
+    )
+    text_lower = text.lower()
+    return any(keyword in text_lower for keyword in keywords)
+
+
+def _build_video_recording_instruction(stream_id: str, video_filename: str) -> str:
+    """Build instruction for agent to record browser activity."""
+    return (
+        f"[Video Recording] Please record this browser session for live sharing.\n"
+        f"When you start using the browser:\n"
+        f"  1. Call: browser_start_video with filename: {video_filename}\n"
+        f"  2. Call: browser_video_show_actions to annotate your clicks/actions\n"
+        f"When done with the browser:\n"
+        f"  3. Call: browser_stop_video to finalize the recording\n"
+        f"The video will be streamed at: http://{STREAM_HOST}:{STREAM_PORT}/stream/{stream_id}\n"
+        f"Users can watch it live as you work."
+    )
+
+
 def _handle_brain_turn(
     cfg: Config, store: ThreadStore, client, channel: str, thread_ts: str, msg_ts: str | None,
     user_id: str, text: str, placeholder_ts: str | None, success_reaction: str = "white_check_mark",
@@ -692,6 +718,31 @@ def _handle_brain_turn(
         brain.set_session_for_thread(thread_ts, prior.session_id)
     store.update(thread_ts, channel=channel, user=user_id, last_message=text, agent_cmd=cfg.main_agent_cmd, status="running")
     _set_status(client, channel, thread_ts, "Working on your request...")
+
+    # Detect browser tasks and start video streaming
+    stream_id = None
+    stream_session = None
+    if _is_browser_task(text):
+        stream_id = str(uuid.uuid4())[:12]
+        try:
+            stream_session = VideoStreamSession(stream_id, task_name=text[:60])
+            stream_session.start()
+            video_url = stream_session.get_url()
+            store.update(thread_ts, video_stream_id=stream_id)
+            # Post video stream link
+            try:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f"🎬 *Live browser session:* <{video_url}|Watch live>",
+                )
+            except Exception as e:
+                log.warning("Failed to post video stream link: %s", e)
+        except Exception as e:
+            log.warning("Failed to start video streaming: %s", e)
+            stream_id = None
+            stream_session = None
+
     on_progress = _make_progress_callback(client, channel, thread_ts, placeholder_ts)
     try:
         turn = brain.ask_brain(cfg.main_agent_cmd, thread_ts, text, cfg.turn_log_path, on_progress=on_progress)
@@ -711,6 +762,14 @@ def _handle_brain_turn(
             _swap_reaction(client, channel, msg_ts, "hourglass_flowing_sand", "x")
         _finalize_error(client, channel, thread_ts, placeholder_ts, e)
         return
+    finally:
+        # Clean up video stream session
+        if stream_session:
+            try:
+                stream_session.stop()
+                stream_session.cleanup(delay_s=5.0)
+            except Exception as e:
+                log.debug("Error during video stream cleanup: %s", e)
 
     if turn.reply.strip() == NO_REPLY_TOKEN:
         log.info("brain returned NO_REPLY — staying silent")
@@ -738,7 +797,15 @@ def _kickoff(cfg: Config, store: ThreadStore, client, channel: str, thread_ts: s
     context_note = _fetch_discussion_context(client, channel, thread_ts, msg_ts) if _wants_discussion_context(text) else None
     state = store.get(thread_ts)
     trigger_note = _format_trigger_note(state.triggers if state else None)
-    prompt = _augment_prompt(text, file_paths or [], "\n\n".join(note for note in [context_note, trigger_note] if note))
+
+    # Add video recording instruction for browser tasks
+    notes = [context_note, trigger_note]
+    if _is_browser_task(text):
+        stream_id = str(uuid.uuid4())[:12]
+        video_filename = f"{stream_id}.mp4"
+        notes.append(_build_video_recording_instruction(stream_id, video_filename))
+
+    prompt = _augment_prompt(text, file_paths or [], "\n\n".join(note for note in notes if note))
     store.update(
         thread_ts,
         channel=channel,
@@ -758,6 +825,9 @@ def build_app(cfg: Config) -> App:
     store = ThreadStore(cfg.telly_home)
     brain.restore_sessions(store.session_map())
     _start_background_trigger_loop(cfg, store, app.client)
+
+    # Start video streaming server for browser tasks
+    get_stream_server().start()
 
     def _allowed(user_id: str) -> bool:
         return not cfg.allowed_slack_user_ids or user_id in cfg.allowed_slack_user_ids
