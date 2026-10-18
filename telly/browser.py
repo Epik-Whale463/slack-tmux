@@ -16,27 +16,25 @@ from urllib.parse import urlparse
 DEFAULT_TIMEOUT_S = 45
 DEFAULT_VIEWPORT = "1440,1000"
 DEFAULT_TEXT_LIMIT = 20000
+DEFAULT_REMOTE_DEBUGGING_PORT = 9222
 SESSION_ROOT_DIR = "~/.telly/browser-sessions"
 DEFAULT_SESSION_NAME = "default"
 DEFAULT_PROFILE_DIR = "~/.telly/chrome-profile"
 DEFAULT_CHROME_PROFILE_NAME = "Default"
 MCP_OUTPUT_DIR = "~/.telly/playwright-mcp"
+MCP_CONFIG_FILENAME = "config.json"
 PROFILE_LOCK_FILES = ("SingletonLock", "SingletonCookie")
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 def playwright_mcp_config(client: str) -> dict:
     """Return a Playwright MCP config block for the target agent client."""
-    profile = str(_default_profile_dir())
-    output_dir = str(Path(MCP_OUTPUT_DIR).expanduser().resolve())
+    config_path = str(_write_playwright_mcp_config())
     args = [
         "-y",
         "@playwright/mcp@latest",
-        "--browser=chrome",
-        f"--user-data-dir={profile}",
-        f"--output-dir={output_dir}",
-        "--caps=pdf,devtools",
-        "--headless",
+        "--config",
+        config_path,
     ]
 
     if client == "opencode":
@@ -51,6 +49,38 @@ def playwright_mcp_config(client: str) -> dict:
         "command": "npx",
         "args": args,
     }
+
+
+def _write_playwright_mcp_config() -> Path:
+    """Write the MCP config required to expose Chrome over CDP for live streaming."""
+    output_dir = Path(MCP_OUTPUT_DIR).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    launch_args = []
+    remote_debugging_arg = _remote_debugging_arg()
+    if remote_debugging_arg:
+        launch_args.append(remote_debugging_arg)
+    if os.geteuid() == 0:
+        launch_args.append("--no-sandbox")
+    launch_options: dict = {
+        "headless": True,
+        "args": launch_args,
+    }
+    path = chrome_path()
+    if path:
+        launch_options["executablePath"] = path
+    config = {
+        "browser": {
+            "browserName": "chromium",
+            "userDataDir": str(_default_profile_dir()),
+            "launchOptions": launch_options,
+        },
+        "capabilities": ["core", "pdf", "devtools"],
+        "outputDir": str(output_dir),
+        "imageResponses": "allow",
+    }
+    config_path = output_dir / MCP_CONFIG_FILENAME
+    config_path.write_text(json.dumps(config, indent=2))
+    return config_path
 
 
 class BrowserError(RuntimeError):
@@ -68,6 +98,24 @@ def chrome_path() -> str | None:
     return None
 
 
+def remote_debugging_port() -> int | None:
+    value = os.environ.get("TELLY_BROWSER_REMOTE_DEBUGGING_PORT", str(DEFAULT_REMOTE_DEBUGGING_PORT)).strip().lower()
+    if value in {"", "0", "false", "no", "off"}:
+        return None
+    try:
+        port = int(value)
+    except ValueError as e:
+        raise BrowserError("TELLY_BROWSER_REMOTE_DEBUGGING_PORT must be an integer port or 0/off") from e
+    if port < 1 or port > 65535:
+        raise BrowserError("TELLY_BROWSER_REMOTE_DEBUGGING_PORT must be between 1 and 65535")
+    return port
+
+
+def _remote_debugging_arg() -> str | None:
+    port = remote_debugging_port()
+    return f"--remote-debugging-port={port}" if port else None
+
+
 def capability_text() -> str:
     path = chrome_path()
     if not path:
@@ -77,7 +125,7 @@ def capability_text() -> str:
     automation = "Playwright automation is installed" if _has_playwright() else "Chrome capture fallback is available"
     mcp = "Playwright MCP is injected into spawned Claude/OpenCode turns" if shutil.which("npx") else "Playwright MCP unavailable; `npx` not found"
     return (
-        f"Browser automation available via local Chrome ({automation}; {mcp}). Never use the user's normal Chrome profile unless explicitly asked. For each browser job, choose a descriptive persistent session name such as `linkedin`, `whatsapp`, or `gmail`, and keep all work for that site in that named telly session under `{_session_root_dir()}`. Use Playwright MCP first only for interactive debugging in the default telly session `{profile}`; for reusable authenticated site work, prefer the `telly.browser` CLI with `--session NAME`.\n"
+        f"Browser automation available via local Chrome ({automation}; {mcp}). Never use the user's normal Chrome profile unless explicitly asked. For each browser job, choose a descriptive persistent session name such as `linkedin`, `whatsapp`, or `gmail`, and keep all work for that site in that named telly session under `{_session_root_dir()}`. Use Playwright MCP first only for interactive debugging in the default telly session `{profile}`; for reusable authenticated site work, prefer the `telly.browser` CLI with `--session NAME`. Live browser sharing is handled by telly through Chrome remote debugging; do not look for `browser_start_video`/`browser_stop_video` tools.\n"
         f"- `{py} -m telly.browser --session linkedin text URL` for readable rendered page text in the `linkedin` session\n"
         f"- `{py} -m telly.browser --session linkedin dom URL` for rendered HTML/DOM\n"
         f"- `{py} -m telly.browser --session linkedin metadata URL` for title, final URL, and text summary\n"
@@ -294,6 +342,9 @@ def _playwright_context(args: argparse.Namespace):
         profile.mkdir(parents=True, exist_ok=True)
         _ensure_profile_available(profile)
         launch_args = []
+        remote_debugging_arg = _remote_debugging_arg()
+        if remote_debugging_arg:
+            launch_args.append(remote_debugging_arg)
         if getattr(args, "profile_name", ""):
             launch_args.append(f"--profile-directory={args.profile_name}")
         context = pw.chromium.launch_persistent_context(
@@ -307,7 +358,11 @@ def _playwright_context(args: argparse.Namespace):
         page = context.pages[0] if context.pages else context.new_page()
         return pw, None, context, page
 
-    browser = pw.chromium.launch(executable_path=path, headless=not getattr(args, "headed", False))
+    launch_args = []
+    remote_debugging_arg = _remote_debugging_arg()
+    if remote_debugging_arg:
+        launch_args.append(remote_debugging_arg)
+    browser = pw.chromium.launch(executable_path=path, headless=not getattr(args, "headed", False), args=launch_args)
     if storage_state and Path(storage_state).expanduser().exists():
         context_kwargs["storage_state"] = str(Path(storage_state).expanduser())
     context = browser.new_context(**context_kwargs)

@@ -31,7 +31,7 @@ class SlackFormatTest(unittest.TestCase):
 
         blocks = slackfmt.build_blocks("See chart", visualization_blocks=[visualization], actions_block=actions)
 
-        self.assertEqual(blocks[0]["type"], "section")
+        self.assertEqual(blocks[0]["type"], "markdown")
         self.assertEqual(blocks[1], visualization)
         self.assertEqual(blocks[2]["type"], "actions")
 

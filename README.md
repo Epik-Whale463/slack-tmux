@@ -2,6 +2,16 @@
 
 Slack-facing coding agent that runs local coding CLIs in resumable tmux-backed sessions.
 
+Telly uses Slack's latest agent surfaces:
+
+- **Text streaming** (`chat.startStream` / `appendStream` / `stopStream`) with plan-mode task updates
+- **Assistant status** + loading messages while the local agent runs
+- **Markdown / table / plan / visualization** Block Kit for answers
+- **Feedback buttons** + modal on thumbs-down
+- Compatible with **agent_view** (Messages tab) and legacy **assistant_view**
+
+See `manifest.agent.yaml` for scopes and event subscriptions to enable in the Slack app settings.
+
 ## Setup
 
 ```bash
@@ -11,7 +21,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Fill in the Slack credentials in `.env` before running.
+Fill in the Slack credentials in `.env` before running. Enable the **Agents** feature on the app and subscribe to the events listed in `manifest.agent.yaml`.
 
 ## Run
 

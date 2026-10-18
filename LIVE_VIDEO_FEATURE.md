@@ -2,7 +2,7 @@
 
 ## Overview
 
-This feature enables **live browser automation monitoring** directly in Slack. Users can watch their agent's browser actions in real-time as they happen.
+This feature enables **live browser automation monitoring** directly in Slack. Users can watch the active agent-controlled Chrome page in near real time.
 
 ## How It Works
 
@@ -11,38 +11,36 @@ This feature enables **live browser automation monitoring** directly in Slack. U
 ```
 User writes message → Slack → App detects "browser task" → 
   ↓
-Generates stream URL → Posts to Slack thread → 
+Generates stream URL → Posts to Slack thread →
   ↓
-Instructs agent to record video → Agent uses Playwright MCP to record →
+Agent uses Playwright MCP or telly.browser CLI →
   ↓
-HTTP server streams MP4 → User clicks link, watches live → 
+HTTP server captures live JPEG frames through Chrome remote debugging → User clicks link, watches live →
   ↓
-Task completes → Auto-cleanup (30s delay)
+Task completes → Status/optional finalized files clean up
 ```
 
 ### Key Components
 
 1. **Browser Task Detection** (`app.py:_is_browser_task()`)
-   - Analyzes prompt for keywords: "browser", "navigate", "click", "screenshot", etc.
-   - Triggers video recording automatically
+    - Analyzes prompt for keywords: "browser", "navigate", "click", "screenshot", etc.
+   - Triggers live browser sharing automatically
 
 2. **Video Stream Server** (`video_stream.py:VideoStreamHTTPHandler`)
-   - Runs on `localhost:9999` (configurable)
-   - Serves video files from Playwright MCP output directory
-   - Provides status pages and streaming capabilities
-   - HTML UI shows task progress + video player
+    - Runs on `localhost:9999` (configurable)
+    - Captures the active Chrome page through CDP on the configured remote-debugging port
+    - Provides status pages and a live auto-refreshing frame feed
+    - Serves a finalized video file only if one exists in the output directory
 
 3. **Session Management** (`video_stream.py:VideoStreamSession`)
-   - Creates a session for each browser task
-   - Tracks video files using Playwright MCP output directory
-   - Coordinates with the agent about recording
+    - Creates a session for each browser task
+    - Tracks stream status in the Playwright MCP output directory
+    - Coordinates the Slack live-link lifecycle
 
-4. **Agent Integration** (`app.py:_build_video_recording_instruction()`)
-   - Sends instructions to Claude/OpenCode to record the session
-   - Agent calls Playwright MCP tools:
-     - `browser_start_video` - Begin recording
-     - `browser_video_show_actions` - Annotate clicks/actions
-     - `browser_stop_video` - Finalize recording
+4. **Agent Integration** (`app.py:_build_live_browser_instruction()`)
+   - Tells Claude/OpenCode that live sharing is already active
+   - Instructs the agent to use available Playwright MCP tools or the `telly.browser` CLI normally
+   - Explicitly avoids stale `browser_start_video`/`browser_stop_video` instructions because current Playwright MCP does not expose those tools
 
 ## User Experience
 
@@ -60,49 +58,47 @@ Task completes → Auto-cleanup (30s delay)
 
 ### 3. User Clicks Link, Sees:
 - HTML page with task name and status
-- "🔴 Recording in progress..." indicator
-- Auto-refreshing until video is available
-- Then video player with controls
-- Browser actions annotated with highlights
+- "🔴 Live feed active..." indicator
+- Auto-refreshing live browser frame
+- Optional finalized recording controls if a video file exists
 
 ### 4. After Task Completes
-- Video remains available for 30 seconds
-- Auto-deletes to save disk space
-- Can download or screenshot while available
+- Stream status remains available briefly
+- Temporary status/video files auto-delete to save disk space
+- User can keep the live page open while the task runs
 
 ## Technical Details
 
-### Video Recording Flow
+### Live Browser Flow
 
 1. **Task Initiation** (`_kickoff()`)
    - Detects browser task
    - Creates `VideoStreamSession` with unique stream ID
-   - Augments prompt with recording instructions
+   - Augments prompt with live-sharing instructions
 
-2. **Recording Instructions**
+2. **Live Sharing Instructions**
    ```
-   [Video Recording] Please record this browser session for live sharing.
-   When you start using the browser:
-     1. Call: browser_start_video with filename: abc123.mp4
-     2. Call: browser_video_show_actions to annotate your clicks/actions
-   When done with the browser:
-     3. Call: browser_stop_video to finalize the recording
-   The video will be streamed at: http://127.0.0.1:9999/stream/abc123
+   [Live Browser Sharing] A live browser feed is already prepared for this task.
+   Use the available Playwright MCP tools or `telly.browser` CLI normally; telly captures the active Chrome page through remote debugging.
+   Do not call `browser_start_video`, `browser_video_show_actions`, or `browser_stop_video`; current Playwright MCP does not expose those tools.
+   The live feed is at: http://127.0.0.1:9999/stream/abc123
    ```
 
-3. **Video Storage**
+3. **Status/Optional Video Storage**
    - Output directory: `~/.telly/playwright-mcp/`
-   - File naming: `<stream-id>.mp4`
+   - Optional video file naming: `<stream-id>.mp4`
    - Status tracking: `<stream-id>.status.json`
 
 4. **HTTP Serving**
-   - Direct MP4 file serving with proper headers
-   - Status page while recording
-   - Auto-refresh mechanism
+   - Live frame endpoint captures the active browser page through CDP
+   - Direct MP4 file serving with proper headers if a finalized video exists
+   - Status page with auto-refresh mechanism
 
 ### HTTP Server Endpoints
 
 - `GET /stream/<stream-id>` - Main video stream page
+- `GET /stream/<stream-id>/live` - Current live browser frame
+- `GET /stream/<stream-id>/video` - Optional finalized video file
 - `GET /health` - Health check
 - `GET /streams` - List active streams
 - `POST /api/start` - Create new stream
@@ -112,8 +108,9 @@ Task completes → Auto-cleanup (30s delay)
 
 ### Environment Variables
 
-- `TELLY_PLAYWRIGHT_MCP=1` - Enable Playwright MCP (default: 1)
-- Not needed; video recording is automatic for detected browser tasks
+- `TELLY_PLAYWRIGHT_MCP=1` - Enable Playwright MCP injection (default: 1)
+- `TELLY_BROWSER_REMOTE_DEBUGGING_PORT=9222` - CDP port used by the live stream server; set to `0` or `off` to disable CDP launch args
+- Live sharing is automatic for detected browser tasks
 
 ### Port
 

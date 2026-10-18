@@ -1,5 +1,6 @@
 """Live video streaming for browser automation tasks."""
 
+import html
 import json
 import logging
 import os
@@ -7,19 +8,24 @@ import subprocess
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
+
+from .browser import remote_debugging_port
 
 log = logging.getLogger(__name__)
 
 PLAYWRIGHT_OUTPUT_DIR = Path("~/.telly/playwright-mcp").expanduser().resolve()
 STREAM_PORT = 9999
 STREAM_HOST = "127.0.0.1"
+LIVE_FRAME_INTERVAL_S = 0.4
+LIVE_JPEG_QUALITY = 55
 
 
 class VideoStreamSession:
-    """Manages a browser recording/streaming session using Playwright MCP."""
+    """Manages a browser live-sharing session."""
 
     def __init__(self, stream_id: str, task_name: str = "browser-task"):
         self.stream_id = stream_id
@@ -29,13 +35,13 @@ class VideoStreamSession:
         self.status_file = PLAYWRIGHT_OUTPUT_DIR / f"{stream_id}.status.json"
 
     def start(self) -> None:
-        """Start recording session."""
+        """Start live sharing session."""
         PLAYWRIGHT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         self._write_status("recording", {"started_at": time.time()})
-        log.info("Video stream session started: %s (will save to %s)", self.stream_id, self.video_filename)
+        log.info("Video stream session started: %s", self.stream_id)
 
     def stop(self) -> None:
-        """Stop recording."""
+        """Stop live sharing."""
         self._write_status("stopped", {"stopped_at": time.time()})
         log.info("Video stream session stopped: %s", self.stream_id)
 
@@ -44,7 +50,7 @@ class VideoStreamSession:
         return f"http://{STREAM_HOST}:{STREAM_PORT}/stream/{self.stream_id}"
 
     def get_video_filename(self) -> str:
-        """Get the filename to use when calling browser_start_video."""
+        """Get the optional finalized recording filename for this stream."""
         return self.video_filename
 
     def cleanup(self, delay_s: float = 30.0) -> None:
@@ -84,12 +90,22 @@ class VideoStreamHTTPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         """Handle GET requests for video streams."""
-        if self.path.startswith("/stream/"):
-            stream_id = self.path[8:].split("/")[0]
+        path = urlsplit(self.path).path
+        if path.startswith("/stream/"):
+            stream_path = path[8:]
+            parts = [part for part in stream_path.split("/") if part]
+            stream_id = parts[0] if parts else ""
+            if len(parts) > 1:
+                if parts[1] == "video":
+                    self._serve_stream_video(stream_id)
+                    return
+                if parts[1] == "live":
+                    self._serve_live_stream(stream_id)
+                    return
             self._serve_stream(stream_id)
-        elif self.path == "/health":
+        elif path == "/health":
             self._send_json({"status": "ok"})
-        elif self.path == "/streams":
+        elif path == "/streams":
             self._send_json({"streams": list(self.active_streams.keys())})
         else:
             self._send_error(404, "Not found")
@@ -104,7 +120,7 @@ class VideoStreamHTTPHandler(BaseHTTPRequestHandler):
             self._send_error(404, "Not found")
 
     def _serve_stream(self, stream_id: str) -> None:
-        """Serve HTML page with video player for a stream."""
+        """Serve HTML page with live-sharing status for a stream."""
         status_file = PLAYWRIGHT_OUTPUT_DIR / f"{stream_id}.status.json"
 
         # Read status to find video filename
@@ -124,34 +140,60 @@ class VideoStreamHTTPHandler(BaseHTTPRequestHandler):
         video_filename = status.get("video_filename", f"{stream_id}.mp4")
         video_path = PLAYWRIGHT_OUTPUT_DIR / video_filename
 
-        # If video exists, serve it; otherwise serve HTML status page
-        if video_path.exists():
-            self._serve_file(video_path, "video/mp4")
-        else:
-            html = self._build_stream_html(stream_id, state, task_name, video_path.exists())
-            self._send_html(html)
+        html = self._build_stream_html(stream_id, state, task_name, video_path.exists())
+        self._send_html(html)
+
+    def _serve_stream_video(self, stream_id: str) -> None:
+        """Serve the finalized recording file for a stream."""
+        status_file = PLAYWRIGHT_OUTPUT_DIR / f"{stream_id}.status.json"
+        video_filename = f"{stream_id}.mp4"
+        if status_file.exists():
+            try:
+                status = json.loads(status_file.read_text())
+                video_filename = status.get("video_filename", video_filename)
+            except Exception:
+                pass
+        video_path = PLAYWRIGHT_OUTPUT_DIR / video_filename
+        if not video_path.exists():
+            self._send_error(404, "Video not ready")
+            return
+        self._serve_file(video_path, "video/mp4")
 
     def _build_stream_html(self, stream_id: str, state: str, task_name: str, has_video: bool) -> str:
         """Build HTML for stream status page."""
-        video_url = f"http://{STREAM_HOST}:{STREAM_PORT}/stream/{stream_id}"
+        live_url = f"http://{STREAM_HOST}:{STREAM_PORT}/stream/{stream_id}/live"
+        video_url = f"http://{STREAM_HOST}:{STREAM_PORT}/stream/{stream_id}/video"
+        safe_task_name = html.escape(task_name)
+        safe_stream_id = html.escape(stream_id)
 
         status_html = {
-            "recording": f'<div style="color: #ff6b6b; font-weight: bold;">🔴 Recording in progress...</div>',
-            "stopped": f'<div style="color: #51cf66; font-weight: bold;">✅ Recording stopped</div>',
+            "recording": f'<div style="color: #ff6b6b; font-weight: bold;">🔴 Live feed active...</div>',
+            "stopped": f'<div style="color: #51cf66; font-weight: bold;">✅ Live feed stopped</div>',
             "unknown": f'<div style="color: #ffd43b;">⏳ Status unknown</div>',
         }.get(state, '<div>Unknown state</div>')
 
-        html = f"""<!DOCTYPE html>
+        playback_html = ""
+        if has_video:
+            playback_html = (
+                '<details style="margin-top: 20px;">'
+                '<summary style="cursor: pointer; color: #ccc;">Show finalized recording</summary>'
+                f'<video controls style="margin-top: 12px;"><source src="{video_url}" type="video/mp4">Your browser does not support the video tag.</video>'
+                '</details>'
+            )
+
+        page_html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Live Browser Task - {task_name}</title>
+    <title>Live Browser Feed - {safe_task_name}</title>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 20px; background: #1a1a1a; color: #fff; }}
         .container {{ max-width: 1200px; margin: 0 auto; }}
         .header {{ margin-bottom: 20px; }}
         .status {{ margin: 20px 0; padding: 15px; background: #2a2a2a; border-radius: 8px; }}
+        .feed {{ width: 100%; max-width: 100%; border-radius: 8px; background: #000; display: block; aspect-ratio: 16 / 10; object-fit: contain; }}
         video {{ width: 100%; max-width: 100%; border-radius: 8px; background: #000; }}
         .info {{ margin-top: 20px; padding: 15px; background: #2a2a2a; border-radius: 8px; }}
+        .hint {{ color: #999; margin-top: 12px; }}
         .live {{ animation: pulse 1.5s infinite; }}
         @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} }}
     </style>
@@ -159,30 +201,61 @@ class VideoStreamHTTPHandler(BaseHTTPRequestHandler):
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎬 {task_name}</h1>
-            <p>Live browser automation stream</p>
+            <h1>🎬 {safe_task_name}</h1>
+            <p>Live browser feed</p>
         </div>
 
         <div class="status">
             {status_html}
         </div>
 
-        {'<video controls><source src="' + video_url + '" type="video/mp4">Your browser does not support the video tag.</video>' if has_video else '<p style="color: #999;">Video recording in progress... Refresh to see updates.</p>'}
+        <img class="feed" id="live-feed" src="{live_url}" alt="Live browser feed" />
+        <p class="hint">If the feed is blank for a moment, the browser is still launching. This view refreshes continuously while the task runs.</p>
+        {playback_html}
 
         <div class="info">
-            <h3>Stream ID: <code>{stream_id}</code></h3>
-            <p>This stream will auto-delete after the task completes.</p>
+            <h3>Stream ID: <code>{safe_stream_id}</code></h3>
+            <p>This page shows a live frame stream from the active browser page.</p>
+            <p>Temporary stream files auto-delete shortly after the task completes.</p>
         </div>
 
         <script>
-            if (!"{has_video}".includes("True")) {{
-                setTimeout(() => location.reload(), 2000);
-            }}
+            const liveFeed = document.getElementById("live-feed");
+            const refreshFeed = () => {{
+                liveFeed.src = "{live_url}?t=" + Date.now();
+            }};
+            liveFeed.addEventListener("error", () => {{
+                setTimeout(refreshFeed, 1000);
+            }});
+            setInterval(refreshFeed, {int(LIVE_FRAME_INTERVAL_S * 1000)});
+            refreshFeed();
         </script>
     </div>
 </body>
 </html>"""
-        return html
+        return page_html
+
+    def _serve_live_stream(self, stream_id: str) -> None:
+        """Serve a single live frame captured from the active browser page."""
+        frame = _capture_live_frame_jpeg()
+        if frame:
+            self.send_response(200)
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(frame)))
+            self.end_headers()
+            self.wfile.write(frame)
+            return
+
+        placeholder = _placeholder_live_frame(stream_id)
+        self.send_response(200)
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(placeholder)))
+        self.end_headers()
+        self.wfile.write(placeholder)
 
     def _serve_file(self, filepath: Path, content_type: str) -> None:
         """Serve a file with proper headers."""
@@ -279,7 +352,7 @@ class VideoStreamServer:
 
     def _init(self) -> None:
         """Initialize the server (called once)."""
-        self.server: Optional[HTTPServer] = None
+        self.server: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
         self._started = False
 
@@ -293,7 +366,7 @@ class VideoStreamServer:
                 return
 
             try:
-                self.server = HTTPServer((STREAM_HOST, STREAM_PORT), VideoStreamHTTPHandler)
+                self.server = ThreadingHTTPServer((STREAM_HOST, STREAM_PORT), VideoStreamHTTPHandler)
                 self.thread = threading.Thread(target=self._run, daemon=True, name="video-stream-server")
                 self.thread.start()
                 self._started = True
@@ -324,3 +397,76 @@ class VideoStreamServer:
 def get_stream_server() -> VideoStreamServer:
     """Get or create the singleton video stream server."""
     return VideoStreamServer()
+
+
+def _stream_state(stream_id: str) -> str:
+    status_file = PLAYWRIGHT_OUTPUT_DIR / f"{stream_id}.status.json"
+    if not status_file.exists():
+        return "unknown"
+    try:
+        status = json.loads(status_file.read_text())
+    except Exception:
+        return "unknown"
+    return str(status.get("state") or "unknown")
+
+
+def _placeholder_live_frame(stream_id: str) -> bytes:
+    state = html.escape(_stream_state(stream_id))
+    safe_stream_id = html.escape(stream_id)
+    svg = f"""<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1280 800\">
+<rect width=\"1280\" height=\"800\" fill=\"#111827\"/>
+<rect x=\"80\" y=\"80\" width=\"1120\" height=\"640\" rx=\"24\" fill=\"#1f2937\" stroke=\"#374151\"/>
+<text x=\"640\" y=\"320\" text-anchor=\"middle\" fill=\"#f9fafb\" font-size=\"42\" font-family=\"Arial, sans-serif\">Waiting for live browser frame</text>
+<text x=\"640\" y=\"390\" text-anchor=\"middle\" fill=\"#9ca3af\" font-size=\"26\" font-family=\"Arial, sans-serif\">Stream: {safe_stream_id}</text>
+<text x=\"640\" y=\"435\" text-anchor=\"middle\" fill=\"#9ca3af\" font-size=\"26\" font-family=\"Arial, sans-serif\">State: {state}</text>
+<text x=\"640\" y=\"520\" text-anchor=\"middle\" fill=\"#6b7280\" font-size=\"22\" font-family=\"Arial, sans-serif\">The page auto-refreshes while the browser launches or reconnects.</text>
+</svg>"""
+    return svg.encode("utf-8")
+
+
+def _capture_live_frame_jpeg() -> bytes | None:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+
+    browser = None
+    playwright = None
+    try:
+        playwright = sync_playwright().start()
+        port = remote_debugging_port()
+        if port is None:
+            return None
+        browser = playwright.chromium.connect_over_cdp(f"http://{STREAM_HOST}:{port}")
+        page = _active_browser_page(browser)
+        if page is None:
+            return None
+        return page.screenshot(type="jpeg", quality=LIVE_JPEG_QUALITY, animations="disabled")
+    except Exception:
+        return None
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+
+def _active_browser_page(browser):
+    contexts = list(browser.contexts)
+    contexts.sort(key=lambda ctx: len(ctx.pages), reverse=True)
+    pages = []
+    for context in contexts:
+        pages.extend(context.pages)
+    pages = [page for page in pages if not page.is_closed()]
+    preferred = [
+        page for page in pages
+        if page.url and not page.url.startswith("about:") and not page.url.startswith("chrome:")
+    ]
+    candidates = preferred or pages
+    return candidates[-1] if candidates else None

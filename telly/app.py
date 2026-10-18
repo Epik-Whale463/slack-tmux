@@ -12,16 +12,15 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from . import brain, slackfmt
+from .agent_stream import AgentReplyStream, LOADING_MESSAGES
 from .config import Config
 from .state import ThreadStore
-from .video_stream import get_stream_server, VideoStreamSession, PLAYWRIGHT_OUTPUT_DIR, STREAM_HOST, STREAM_PORT
+from .video_stream import get_stream_server, VideoStreamSession, STREAM_HOST, STREAM_PORT
 
 log = logging.getLogger(__name__)
 
 MENTION_RE = re.compile(r"<@[UW][A-Z0-9]+>")
 NO_REPLY_TOKEN = "NO_REPLY"
-PROGRESS_PLACEHOLDER_TEXT = "telly is working..."
-PROGRESS_UPDATE_INTERVAL_S = 1.2
 LONG_REPLY_FILE_THRESHOLD = 9000
 UPLOAD_MARKER_RE = re.compile(r"^\s*(?:SLACK_UPLOAD|ATTACH_FILE):\s*(.+?)\s*$", re.MULTILINE)
 DISCUSSION_CONTEXT_RE = re.compile(
@@ -111,11 +110,23 @@ def _call_assistant(client, method: str, **kwargs) -> None:
         log.debug("%s failed: %s", method, e)
 
 
-def _set_status(client, channel: str, thread_ts: str, status: str) -> None:
-    # We already post one in-thread plan/task card as the loading UI. In the
-    # Slack agent container, assistant status renders as a second visible telly
-    # surface, so keep status disabled to avoid duplicate in-progress messages.
-    return
+def _set_status(
+    client,
+    channel: str,
+    thread_ts: str,
+    status: str,
+    *,
+    loading_messages: list[str] | None = None,
+) -> None:
+    """Set assistant/agent status. Empty status clears the indicator."""
+    kwargs: dict[str, Any] = {
+        "channel_id": channel,
+        "thread_ts": thread_ts,
+        "status": status,
+    }
+    if status and loading_messages:
+        kwargs["loading_messages"] = loading_messages
+    _call_assistant(client, "assistant_threads_setStatus", **kwargs)
 
 
 def _set_title(client, channel: str, thread_ts: str, text: str) -> None:
@@ -123,20 +134,40 @@ def _set_title(client, channel: str, thread_ts: str, text: str) -> None:
     _call_assistant(client, "assistant_threads_setTitle", channel_id=channel, thread_ts=thread_ts, title=title)
 
 
-def _set_suggested_prompts(client, channel: str, thread_ts: str) -> None:
-    _call_assistant(
-        client,
-        "assistant_threads_setSuggestedPrompts",
-        channel_id=channel,
-        thread_ts=thread_ts,
-        title="Try telly with:",
-        prompts=[
-            {"title": "Analyze this project", "message": "Analyze this project and suggest the highest-impact improvements."},
-            {"title": "Review recent changes", "message": "Review the recent changes and call out risks."},
-            {"title": "Debug an error", "message": "Help me debug this error. I will paste logs or upload a file."},
-            {"title": "Summarize files", "message": "Summarize the files I upload and tell me what matters."},
-        ],
-    )
+DEFAULT_SUGGESTED_PROMPTS = [
+    {"title": "Analyze this project", "message": "Analyze this project and suggest the highest-impact improvements."},
+    {"title": "Review recent changes", "message": "Review the recent changes and call out risks."},
+    {"title": "Debug an error", "message": "Help me debug this error. I will paste logs or upload a file."},
+    {"title": "Summarize files", "message": "Summarize the files I upload and tell me what matters."},
+]
+
+
+def _set_suggested_prompts(
+    client,
+    channel: str,
+    thread_ts: str | None = None,
+    *,
+    context_channel_id: str | None = None,
+) -> None:
+    """Set suggested prompts for assistant_view (per-thread) or agent_view (Messages tab)."""
+    prompts = list(DEFAULT_SUGGESTED_PROMPTS)
+    if context_channel_id:
+        prompts = [
+            {
+                "title": "Summarize this channel",
+                "message": f"Summarize recent discussion in <#{context_channel_id}> and call out open questions.",
+            },
+            *prompts[:3],
+        ]
+    kwargs: dict[str, Any] = {
+        "channel_id": channel,
+        "title": "Try telly with:",
+        "prompts": prompts[:4],
+    }
+    # agent_view pins prompts at the top of Messages and does not require thread_ts.
+    if thread_ts:
+        kwargs["thread_ts"] = thread_ts
+    _call_assistant(client, "assistant_threads_setSuggestedPrompts", **kwargs)
 
 
 def _download_slack_files(cfg: Config, event: dict) -> list[str]:
@@ -428,90 +459,6 @@ def _fetch_discussion_context(client, channel: str, thread_ts: str, msg_ts: str 
     )
 
 
-def _post_placeholder(client, channel: str, thread_ts: str) -> str | None:
-    try:
-        resp = client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=PROGRESS_PLACEHOLDER_TEXT,
-            blocks=slackfmt.build_loading_blocks(thread_ts),
-        )
-        return resp["ts"]
-    except Exception:
-        log.exception("agent placeholder post failed; falling back to basic blocks")
-    try:
-        resp = client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=PROGRESS_PLACEHOLDER_TEXT,
-            blocks=slackfmt.build_plain_loading_blocks(thread_ts),
-        )
-        return resp["ts"]
-    except Exception:
-        log.exception("placeholder fallback post failed")
-        return None
-
-
-def _make_progress_callback(client, channel: str, thread_ts: str, placeholder_ts: str | None):
-    if not placeholder_ts:
-        return None
-
-    last_sent = 0.0
-    last_signature: tuple[int, str, str] | None = None
-    lock = threading.Lock()
-
-    def on_progress(state: dict) -> None:
-        nonlocal last_sent, last_signature
-        tool_events = state.get("tool_events") if isinstance(state.get("tool_events"), list) else []
-        partial_text = str(state.get("partial_text") or "")
-        signature = (len(tool_events), tool_events[-1].get("status", "") if tool_events else "", partial_text[-200:])
-        now = time.monotonic()
-        with lock:
-            if signature == last_signature or now - last_sent < PROGRESS_UPDATE_INTERVAL_S:
-                return
-            last_signature = signature
-            last_sent = now
-        try:
-            client.chat_update(
-                channel=channel,
-                ts=placeholder_ts,
-                text=PROGRESS_PLACEHOLDER_TEXT,
-                blocks=slackfmt.build_activity_blocks(thread_ts, tool_events, partial_text),
-            )
-        except Exception:
-            log.debug("progress chat.update failed", exc_info=True)
-
-    return on_progress
-
-
-def _post_or_update_final(
-    client,
-    channel: str,
-    thread_ts: str,
-    placeholder_ts: str | None,
-    text: str,
-    blocks: list[dict],
-    fallback_blocks: list[dict],
-) -> None:
-    if placeholder_ts:
-        try:
-            client.chat_update(channel=channel, ts=placeholder_ts, text=text, blocks=blocks)
-            return
-        except Exception:
-            log.exception("final chat.update with agent blocks failed; retrying basic blocks")
-        try:
-            client.chat_update(channel=channel, ts=placeholder_ts, text=text, blocks=fallback_blocks)
-            return
-        except Exception:
-            log.exception("final chat.update fallback failed; falling back to postMessage")
-
-    try:
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=blocks)
-    except Exception:
-        log.exception("final postMessage with agent blocks failed; retrying basic blocks")
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=fallback_blocks)
-
-
 def _try_upload_long_reply(client, channel: str, thread_ts: str, text: str) -> bool:
     try:
         client.files_upload_v2(
@@ -582,47 +529,170 @@ def _format_upload_failure(path: Path, err: Exception) -> str:
     return f"`{path}` — upload failed; file is still available locally."
 
 
-def _finalize_reply(client, channel: str, thread_ts: str, placeholder_ts: str | None, turn: brain.BrainTurn) -> None:
+def _build_final_message_parts(
+    turn: brain.BrainTurn,
+    thread_ts: str,
+    *,
+    live_browser_url: str | None = None,
+) -> tuple[str, str, list[dict], list[dict], list[dict], list[Path], str, str | None]:
+    """Return display_md, notify, trailing, legacy, fallback, uploads, full_md, confirm_summary."""
     reply, upload_paths = _extract_upload_markers(turn.reply)
-    reply, visualization_blocks = slackfmt.extract_visualization_blocks(reply)
-    text = slackfmt.to_mrkdwn(reply or ("Here's the visualization." if visualization_blocks else "Uploaded requested file."))
-    if len(text) > LONG_REPLY_FILE_THRESHOLD and _try_upload_long_reply(client, channel, thread_ts, text):
-        summary = "The answer was long, so I attached the full response as a Markdown file."
-        actions_block = slackfmt.build_actions_block(thread_ts)
-        feedback_block = slackfmt.build_feedback_block(thread_ts)
-        footer_block = slackfmt.build_footer_block(turn.session_id, turn.cost_usd, turn.duration_ms)
-        blocks = slackfmt.build_blocks(summary, actions_block=actions_block, feedback_block=feedback_block, footer=footer_block)
-        fallback_blocks = slackfmt.build_blocks(summary, actions_block=actions_block, footer=footer_block)
-        _post_or_update_final(client, channel, thread_ts, placeholder_ts, summary, blocks, fallback_blocks)
-        return
+    reply, confirm_summary = slackfmt.extract_confirm_request(reply)
+    reply, content_blocks = slackfmt.extract_native_content(reply)
+    content_blocks = slackfmt.sanitize_blocks_for_messages(content_blocks)
 
-    chunks = slackfmt.chunk_for_slack(text)
+    if not confirm_summary and slackfmt.looks_like_confirmation_request(reply):
+        # Soft-detect "should I proceed?" style asks and surface real buttons
+        confirm_summary = _truncate_confirm_summary(reply)
+
+    empty_placeholder = (
+        "Here's the structured result."
+        if content_blocks
+        else ("Uploaded requested file." if upload_paths else "Done.")
+    )
+    markdown_text = (reply or empty_placeholder).strip()
+    notify_text = slackfmt.to_mrkdwn(markdown_text)
+
     breadcrumbs_block = slackfmt.build_breadcrumb_block(turn.tool_breadcrumbs)
     footer_block = slackfmt.build_footer_block(turn.session_id, turn.cost_usd, turn.duration_ms)
-    actions_block = slackfmt.build_actions_block(thread_ts)
-    feedback_block = slackfmt.build_feedback_block(thread_ts)
-    completion_block = slackfmt.build_completion_task_block(thread_ts, turn.duration_ms)
-
-    first_chunk = chunks[0]
-    first_blocks = slackfmt.build_blocks(
-        first_chunk,
-        completion_block=completion_block,
-        breadcrumbs_block=breadcrumbs_block,
-        visualization_blocks=visualization_blocks,
-        actions_block=actions_block if len(chunks) == 1 else None,
-        feedback_block=feedback_block if len(chunks) == 1 else None,
-        footer=footer_block if len(chunks) == 1 else None,
-    )
-    first_fallback_blocks = slackfmt.build_blocks(
-        first_chunk,
-        breadcrumbs_block=breadcrumbs_block,
-        actions_block=actions_block if len(chunks) == 1 else None,
-        footer=footer_block if len(chunks) == 1 else None,
+    # When awaiting permission, only show Approve/Deny — not regenerate/fork noise
+    actions_block = None if confirm_summary else slackfmt.build_actions_block(thread_ts)
+    feedback_block = None if confirm_summary else slackfmt.build_feedback_block(thread_ts)
+    tool_events = turn.tool_events or turn.tool_breadcrumbs
+    sources = slackfmt.collect_task_sources(tool_events, live_browser_url=live_browser_url)
+    file_paths = slackfmt.file_paths_from_tool_events(tool_events)
+    completion_block = slackfmt.build_completion_task_block(
+        thread_ts,
+        turn.duration_ms,
+        sources=sources,
+        file_paths=file_paths,
     )
 
-    _post_or_update_final(
-        client, channel, thread_ts, placeholder_ts, first_chunk, first_blocks, first_fallback_blocks
+    # Message-safe leading chrome (never use modal-only alert in messages)
+    leading: list[dict] = []
+    if confirm_summary:
+        leading.extend(slackfmt.build_permission_blocks(thread_ts, confirm_summary))
+    else:
+        leading.append(slackfmt.build_message_status_block("Response ready.", level="success"))
+        try:
+            leading.append(slackfmt.build_completion_card(
+                thread_ts, turn.duration_ms, sources=sources, file_paths=file_paths,
+            ))
+        except (TypeError, ValueError):
+            pass
+
+    display_markdown = markdown_text
+    if len(markdown_text) > LONG_REPLY_FILE_THRESHOLD:
+        display_markdown = "The answer was long, so I attached the full response as a Markdown file."
+
+    trailing_blocks = slackfmt.sanitize_blocks_for_messages(
+        leading + slackfmt.build_blocks(
+            "",
+            completion_block=None if confirm_summary else completion_block,
+            breadcrumbs_block=breadcrumbs_block,
+            content_blocks=content_blocks,
+            actions_block=actions_block,
+            feedback_block=feedback_block,
+            footer=footer_block,
+        )
     )
+    legacy_blocks = slackfmt.sanitize_blocks_for_messages(
+        leading + slackfmt.build_blocks(
+            display_markdown,
+            completion_block=None if confirm_summary else completion_block,
+            breadcrumbs_block=breadcrumbs_block,
+            content_blocks=content_blocks,
+            actions_block=actions_block,
+            feedback_block=feedback_block,
+            footer=footer_block,
+        )
+    )
+    # Ultra-safe fallback: section + permission buttons OR section + actions
+    if confirm_summary:
+        legacy_fallback = slackfmt.build_permission_blocks(thread_ts, confirm_summary)
+        if display_markdown:
+            legacy_fallback = [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": slackfmt.to_mrkdwn(display_markdown)[:3000]},
+                    "expand": True,
+                },
+                *legacy_fallback,
+            ]
+    else:
+        legacy_fallback = slackfmt.build_blocks(
+            display_markdown,
+            breadcrumbs_block=breadcrumbs_block,
+            actions_block=slackfmt.build_actions_block(thread_ts),
+            footer=footer_block,
+            use_markdown_block=False,
+        )
+    return (
+        display_markdown,
+        notify_text[:3000] or display_markdown,
+        trailing_blocks,
+        legacy_blocks,
+        legacy_fallback,
+        upload_paths,
+        markdown_text,
+        confirm_summary,
+    )
+
+
+def _truncate_confirm_summary(text: str) -> str:
+    # Prefer last non-empty line as the ask
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if not lines:
+        return "Proceed with the requested action?"
+    # If the last lines look like the question, use them
+    tail = " ".join(lines[-3:])
+    return tail[:400]
+
+
+def _finalize_reply(
+    client,
+    channel: str,
+    thread_ts: str,
+    reply_stream: AgentReplyStream | None,
+    turn: brain.BrainTurn,
+    *,
+    live_browser_url: str | None = None,
+) -> None:
+    (
+        display_markdown,
+        notify_text,
+        trailing_blocks,
+        legacy_blocks,
+        legacy_fallback,
+        upload_paths,
+        full_markdown,
+        confirm_summary,
+    ) = _build_final_message_parts(turn, thread_ts, live_browser_url=live_browser_url)
+
+    if len(full_markdown) > LONG_REPLY_FILE_THRESHOLD:
+        _try_upload_long_reply(client, channel, thread_ts, full_markdown)
+
+    tool_events = turn.tool_events or turn.tool_breadcrumbs
+    if reply_stream:
+        reply_stream.finish_success(
+            markdown_text=display_markdown if not confirm_summary else (display_markdown or "Permission needed."),
+            blocks=trailing_blocks if reply_stream.using_stream else legacy_blocks,
+            fallback_blocks=legacy_fallback,
+            notify_text=notify_text,
+            tool_events=tool_events,
+        )
+    else:
+        for tier in slackfmt.block_fallback_tiers(legacy_blocks, reply_text=display_markdown):
+            try:
+                client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=notify_text, blocks=tier)
+                break
+            except Exception:
+                continue
+        else:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=notify_text, blocks=legacy_fallback)
+
+    if confirm_summary:
+        log.info("permission UI posted thread=%s summary=%s", thread_ts, confirm_summary[:80])
 
     upload_failures = _upload_reply_files(client, channel, thread_ts, upload_paths)
     if upload_failures:
@@ -632,57 +702,18 @@ def _finalize_reply(client, channel: str, thread_ts: str, placeholder_ts: str | 
             text="Could not upload file attachment:\n" + "\n".join(f"- {failure}" for failure in upload_failures),
         )
 
-    for i, chunk in enumerate(chunks[1:], start=1):
-        is_last = i == len(chunks) - 1
-        blocks = slackfmt.build_blocks(
-            chunk,
-            actions_block=actions_block if is_last else None,
-            feedback_block=feedback_block if is_last else None,
-            footer=footer_block if is_last else None,
-        )
-        fallback_blocks = slackfmt.build_blocks(
-            chunk,
-            actions_block=actions_block if is_last else None,
-            footer=footer_block if is_last else None,
-        )
-        try:
-            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk, blocks=blocks)
-        except Exception:
-            log.exception("chunk postMessage with feedback failed; retrying basic blocks")
-            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk, blocks=fallback_blocks)
-
-
-def _finalize_cancelled(client, channel: str, thread_ts: str, placeholder_ts: str | None) -> None:
-    text = ":octagonal_sign: _stopped by user_"
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-    if placeholder_ts:
-        try:
-            client.chat_update(channel=channel, ts=placeholder_ts, text=text, blocks=blocks)
-            return
-        except Exception:
-            log.exception("cancelled chat.update failed")
-    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=blocks)
-
-
-def _finalize_error(client, channel: str, thread_ts: str, placeholder_ts: str | None, err: Exception) -> None:
-    text = f":warning: brain error: `{err}`"
-    blocks = slackfmt.build_error_blocks(thread_ts, str(err))
-    fallback_blocks = slackfmt.build_basic_error_blocks(thread_ts, str(err))
-    if placeholder_ts:
-        try:
-            client.chat_update(channel=channel, ts=placeholder_ts, text=text, blocks=blocks)
-            return
-        except Exception:
-            log.exception("agent error chat.update failed; retrying basic blocks")
-        try:
-            client.chat_update(channel=channel, ts=placeholder_ts, text=text, blocks=fallback_blocks)
-            return
-        except Exception:
-            log.exception("error chat.update fallback failed")
-    try:
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=blocks)
-    except Exception:
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=fallback_blocks)
+    if not (reply_stream and reply_stream.using_stream) and len(full_markdown) <= LONG_REPLY_FILE_THRESHOLD and not confirm_summary:
+        chunks = slackfmt.chunk_for_slack(full_markdown, limit=slackfmt.SLACK_MAX_MARKDOWN)
+        for chunk in chunks[1:]:
+            for tier in slackfmt.block_fallback_tiers(
+                slackfmt.build_blocks(chunk),
+                reply_text=chunk,
+            ):
+                try:
+                    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk[:3000], blocks=tier)
+                    break
+                except Exception:
+                    continue
 
 
 def _is_browser_task(text: str) -> bool:
@@ -695,46 +726,61 @@ def _is_browser_task(text: str) -> bool:
     return any(keyword in text_lower for keyword in keywords)
 
 
-def _build_video_recording_instruction(stream_id: str, video_filename: str) -> str:
-    """Build instruction for agent to record browser activity."""
+def _build_live_browser_instruction(stream_id: str) -> str:
+    """Build instruction for agent-visible live browser sharing."""
     return (
-        f"[Video Recording] Please record this browser session for live sharing.\n"
-        f"When you start using the browser:\n"
-        f"  1. Call: browser_start_video with filename: {video_filename}\n"
-        f"  2. Call: browser_video_show_actions to annotate your clicks/actions\n"
-        f"When done with the browser:\n"
-        f"  3. Call: browser_stop_video to finalize the recording\n"
-        f"The video will be streamed at: http://{STREAM_HOST}:{STREAM_PORT}/stream/{stream_id}\n"
-        f"Users can watch it live as you work."
+        f"[Live Browser Sharing] A live browser feed is already prepared for this task.\n"
+        f"Use the available Playwright MCP tools or `telly.browser` CLI normally; telly captures the active Chrome page through remote debugging.\n"
+        f"Do not call `browser_start_video`, `browser_video_show_actions`, or `browser_stop_video`; current Playwright MCP does not expose those tools.\n"
+        f"The live feed is at: http://{STREAM_HOST}:{STREAM_PORT}/stream/{stream_id}\n"
+        f"Keep the browser page active while doing visible browser work so the user can watch it live."
     )
 
 
 def _handle_brain_turn(
-    cfg: Config, store: ThreadStore, client, channel: str, thread_ts: str, msg_ts: str | None,
-    user_id: str, text: str, placeholder_ts: str | None, success_reaction: str = "white_check_mark",
+    cfg: Config,
+    store: ThreadStore,
+    client,
+    channel: str,
+    thread_ts: str,
+    msg_ts: str | None,
+    user_id: str,
+    text: str,
+    *,
+    team_id: str | None = None,
+    background: bool = False,
+    success_reaction: str = "white_check_mark",
 ) -> None:
     prior = store.get(thread_ts)
     if prior and prior.session_id:
         brain.set_session_for_thread(thread_ts, prior.session_id)
     store.update(thread_ts, channel=channel, user=user_id, last_message=text, agent_cmd=cfg.main_agent_cmd, status="running")
-    _set_status(client, channel, thread_ts, "Working on your request...")
+    _set_status(
+        client,
+        channel,
+        thread_ts,
+        "is working on your request…",
+        loading_messages=LOADING_MESSAGES,
+    )
 
     # Detect browser tasks and start video streaming
-    stream_id = None
+    stream_id = prior.video_stream_id if prior and _is_browser_task(text) else None
     stream_session = None
+    live_browser_url: str | None = None
     if _is_browser_task(text):
-        stream_id = str(uuid.uuid4())[:12]
+        if stream_id is None:
+            stream_id = str(uuid.uuid4())[:12]
+            store.update(thread_ts, video_stream_id=stream_id)
         try:
             stream_session = VideoStreamSession(stream_id, task_name=text[:60])
             stream_session.start()
-            video_url = stream_session.get_url()
+            live_browser_url = stream_session.get_url()
             store.update(thread_ts, video_stream_id=stream_id)
-            # Post video stream link
             try:
                 client.chat_postMessage(
                     channel=channel,
                     thread_ts=thread_ts,
-                    text=f"🎬 *Live browser session:* <{video_url}|Watch live>",
+                    text=f"🎬 *Live browser session:* <{live_browser_url}|Watch live>",
                 )
             except Exception as e:
                 log.warning("Failed to post video stream link: %s", e)
@@ -742,8 +788,27 @@ def _handle_brain_turn(
             log.warning("Failed to start video streaming: %s", e)
             stream_id = None
             stream_session = None
+            live_browser_url = None
 
-    on_progress = _make_progress_callback(client, channel, thread_ts, placeholder_ts)
+    reply_stream: AgentReplyStream | None = None
+    if not background:
+        reply_stream = AgentReplyStream(
+            client=client,
+            channel=channel,
+            thread_ts=thread_ts,
+            user_id=user_id,
+            team_id=team_id,
+            task_display_mode="plan",
+            live_browser_url=live_browser_url,
+        )
+        reply_stream.start()
+        if reply_stream.stream_ts or reply_stream.legacy_placeholder_ts:
+            store.update(
+                thread_ts,
+                status="running",
+            )
+
+    on_progress = reply_stream.make_progress_callback() if reply_stream else None
     try:
         turn = brain.ask_brain(cfg.main_agent_cmd, thread_ts, text, cfg.turn_log_path, on_progress=on_progress)
     except brain.BrainCancelled:
@@ -752,7 +817,8 @@ def _handle_brain_turn(
         _set_status(client, channel, thread_ts, "")
         if msg_ts:
             _swap_reaction(client, channel, msg_ts, "hourglass_flowing_sand", "octagonal_sign")
-        _finalize_cancelled(client, channel, thread_ts, placeholder_ts)
+        if reply_stream:
+            reply_stream.finish_cancelled()
         return
     except Exception as e:
         log.exception("brain failure")
@@ -760,10 +826,20 @@ def _handle_brain_turn(
         _set_status(client, channel, thread_ts, "")
         if msg_ts:
             _swap_reaction(client, channel, msg_ts, "hourglass_flowing_sand", "x")
-        _finalize_error(client, channel, thread_ts, placeholder_ts, e)
+        if reply_stream:
+            reply_stream.finish_error(e)
+        else:
+            try:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f":warning: brain error: `{e}`",
+                    blocks=slackfmt.build_basic_error_blocks(thread_ts, str(e)),
+                )
+            except Exception:
+                log.exception("error post failed")
         return
     finally:
-        # Clean up video stream session
         if stream_session:
             try:
                 stream_session.stop()
@@ -773,11 +849,8 @@ def _handle_brain_turn(
 
     if turn.reply.strip() == NO_REPLY_TOKEN:
         log.info("brain returned NO_REPLY — staying silent")
-        if placeholder_ts:
-            try:
-                client.chat_delete(channel=channel, ts=placeholder_ts)
-            except Exception:
-                log.debug("placeholder delete failed; leaving it in place")
+        if reply_stream:
+            reply_stream.discard()
         if msg_ts:
             _swap_reaction(client, channel, msg_ts, "hourglass_flowing_sand", success_reaction)
         store.update(thread_ts, session_id=turn.session_id, status="silent")
@@ -788,22 +861,40 @@ def _handle_brain_turn(
     _set_status(client, channel, thread_ts, "")
     if msg_ts:
         _swap_reaction(client, channel, msg_ts, "hourglass_flowing_sand", success_reaction)
-    _finalize_reply(client, channel, thread_ts, placeholder_ts, turn)
+    _finalize_reply(
+        client,
+        channel,
+        thread_ts,
+        reply_stream,
+        turn,
+        live_browser_url=live_browser_url,
+    )
 
 
-def _kickoff(cfg: Config, store: ThreadStore, client, channel: str, thread_ts: str, msg_ts: str | None, user_id: str, text: str, file_paths: list[str] | None = None, background: bool = False) -> None:
+def _kickoff(
+    cfg: Config,
+    store: ThreadStore,
+    client,
+    channel: str,
+    thread_ts: str,
+    msg_ts: str | None,
+    user_id: str,
+    text: str,
+    file_paths: list[str] | None = None,
+    background: bool = False,
+    team_id: str | None = None,
+) -> None:
     if msg_ts:
         _swap_reaction(client, channel, msg_ts, None, "hourglass_flowing_sand")
     context_note = _fetch_discussion_context(client, channel, thread_ts, msg_ts) if _wants_discussion_context(text) else None
     state = store.get(thread_ts)
     trigger_note = _format_trigger_note(state.triggers if state else None)
+    is_browser_task = _is_browser_task(text)
+    stream_id = str(uuid.uuid4())[:12] if is_browser_task else None
 
-    # Add video recording instruction for browser tasks
     notes = [context_note, trigger_note]
-    if _is_browser_task(text):
-        stream_id = str(uuid.uuid4())[:12]
-        video_filename = f"{stream_id}.mp4"
-        notes.append(_build_video_recording_instruction(stream_id, video_filename))
+    if stream_id:
+        notes.append(_build_live_browser_instruction(stream_id))
 
     prompt = _augment_prompt(text, file_paths or [], "\n\n".join(note for note in notes if note))
     store.update(
@@ -813,11 +904,31 @@ def _kickoff(cfg: Config, store: ThreadStore, client, channel: str, thread_ts: s
         last_message=text,
         agent_cmd=cfg.main_agent_cmd,
         uploaded_files=file_paths or None,
+        video_stream_id=stream_id,
         status="queued",
     )
     _set_title(client, channel, thread_ts, text)
-    placeholder_ts = None if background else _post_placeholder(client, channel, thread_ts)
-    _executor.submit(_handle_brain_turn, cfg, store, client, channel, thread_ts, msg_ts, user_id, prompt, placeholder_ts)
+    # Status opens the agent thread and shows loading immediately (official agent loop).
+    _set_status(
+        client,
+        channel,
+        thread_ts,
+        "is working on your request…",
+        loading_messages=LOADING_MESSAGES,
+    )
+    _executor.submit(
+        _handle_brain_turn,
+        cfg,
+        store,
+        client,
+        channel,
+        thread_ts,
+        msg_ts,
+        user_id,
+        prompt,
+        team_id=team_id,
+        background=background,
+    )
 
 
 def build_app(cfg: Config) -> App:
@@ -855,7 +966,10 @@ def build_app(cfg: Config) -> App:
 
         file_paths = _download_slack_files(cfg, event)
         log.info("mention from %s in %s thread=%s: %s", user_id, channel, thread_ts, text[:120])
-        _kickoff(cfg, store, client, channel, thread_ts, msg_ts, user_id, text, file_paths)
+        _kickoff(
+            cfg, store, client, channel, thread_ts, msg_ts, user_id, text, file_paths,
+            team_id=event.get("team") or event.get("team_id"),
+        )
 
     @app.event("message")
     def on_message(event, client, ack):
@@ -898,7 +1012,22 @@ def build_app(cfg: Config) -> App:
             return
         file_paths = _download_slack_files(cfg, event)
         log.info("thread continuation from %s in %s thread=%s: %s", user_id, channel, thread_ts, clean[:120])
-        _kickoff(cfg, store, client, channel, thread_ts, msg_ts, user_id, clean, file_paths)
+        # Prefer app_context from agent_view message.im payloads when present.
+        app_context = event.get("app_context") or event.get("context") or {}
+        context_channel = None
+        if isinstance(app_context, dict):
+            entities = app_context.get("entities") or []
+            for ent in entities:
+                if isinstance(ent, dict) and ent.get("type") == "slack#/types/channel_id":
+                    context_channel = ent.get("value")
+                    break
+            context_channel = context_channel or app_context.get("channel_id")
+        if context_channel:
+            store.update(thread_ts, channel=context_channel)
+        _kickoff(
+            cfg, store, client, channel, thread_ts, msg_ts, user_id, clean, file_paths,
+            team_id=event.get("team") or event.get("team_id"),
+        )
 
     @app.event("reaction_added")
     def on_reaction_added(event, client, ack):
@@ -958,22 +1087,65 @@ def build_app(cfg: Config) -> App:
         user_id = event.get("user")
         if not user_id or not _allowed(user_id):
             return
+        tab = event.get("tab") or "home"
+        # agent_view: opening the Messages tab is the DM open signal (replaces assistant_thread_started).
+        if tab == "messages":
+            channel = event.get("channel")
+            context = event.get("context") or {}
+            context_channel = context.get("channel_id") if isinstance(context, dict) else None
+            if channel:
+                _set_suggested_prompts(
+                    client,
+                    channel,
+                    thread_ts=None,
+                    context_channel_id=context_channel,
+                )
+            return
         try:
             client.views_publish(user_id=user_id, view=slackfmt.build_home_view(store.list_recent()))
         except Exception:
             log.exception("app home publish failed")
 
+    @app.event("app_context_changed")
+    def on_app_context_changed(event, client, ack):
+        """agent_view: user changed what they're looking at while the agent is open."""
+        ack()
+        user_id = event.get("user") or event.get("user_id", "")
+        if user_id and not _allowed(user_id):
+            return
+        context = event.get("context") or {}
+        entities = context.get("entities") if isinstance(context, dict) else None
+        channel_id = None
+        if isinstance(entities, list):
+            for ent in entities:
+                if isinstance(ent, dict) and ent.get("type") == "slack#/types/channel_id":
+                    channel_id = ent.get("value")
+                    break
+        if channel_id:
+            log.debug("app_context_changed user=%s channel=%s", user_id, channel_id)
+            # Refresh prompts for the DM messages surface when we know the channel.
+            dm = event.get("channel")
+            if dm:
+                _set_suggested_prompts(client, dm, thread_ts=None, context_channel_id=channel_id)
+
     @app.event("assistant_thread_started")
     def on_assistant_thread_started(event, client, ack):
+        """assistant_view (legacy) + still useful while migrating to agent_view."""
         ack()
         assistant_thread = event.get("assistant_thread", {}) or {}
         channel = assistant_thread.get("channel_id") or event.get("channel")
         thread_ts = assistant_thread.get("thread_ts") or event.get("thread_ts") or event.get("ts")
         user_id = event.get("user") or event.get("user_id", "")
+        context = assistant_thread.get("context") or {}
         if not channel or not thread_ts or (user_id and not _allowed(user_id)):
             return
         store.ensure(thread_ts, channel=channel, user=user_id, status="started")
-        _set_suggested_prompts(client, channel, thread_ts)
+        _set_suggested_prompts(
+            client,
+            channel,
+            thread_ts,
+            context_channel_id=context.get("channel_id") if isinstance(context, dict) else None,
+        )
         try:
             client.chat_postMessage(
                 channel=channel,
@@ -984,13 +1156,36 @@ def build_app(cfg: Config) -> App:
             log.debug("assistant welcome failed: %s", e)
 
     @app.event("assistant_thread_context_changed")
-    def on_assistant_context_changed(event, ack):
+    def on_assistant_context_changed(event, client, ack):
         ack()
         assistant_thread = event.get("assistant_thread", {}) or {}
         thread_ts = assistant_thread.get("thread_ts")
         context = assistant_thread.get("context", {}) or {}
+        channel = assistant_thread.get("channel_id")
         if thread_ts:
             store.update(thread_ts, channel=context.get("channel_id"), status="context_changed")
+        if channel and context.get("channel_id"):
+            _set_suggested_prompts(
+                client,
+                channel,
+                thread_ts,
+                context_channel_id=context.get("channel_id"),
+            )
+
+    @app.event("message_stream_stopped")
+    def on_message_stream_stopped(event, client, ack):
+        """User stopped a stoppable chat stream from the Slack UI."""
+        ack()
+        user_id = event.get("user") or event.get("user_id", "")
+        if user_id and not _allowed(user_id):
+            return
+        thread_ts = event.get("thread_ts") or event.get("message_ts")
+        if not thread_ts:
+            return
+        killed = brain.cancel_thread(thread_ts)
+        if killed:
+            store.update(thread_ts, status="cancelled")
+        log.info("message_stream_stopped by %s thread=%s killed=%s", user_id, thread_ts, killed)
 
     @app.action("telly_stop")
     def on_stop(ack, body, client):
@@ -1022,13 +1217,203 @@ def build_app(cfg: Config) -> App:
         channel = body.get("channel", {}).get("id")
         message_ts = body.get("message", {}).get("ts")
         thread_ts = value.split(":", 1)[1] if ":" in value else body.get("message", {}).get("thread_ts")
+        polarity = value.split(":", 1)[0] if ":" in value else value
         log.info("feedback from %s value=%s thread=%s", actor, value, thread_ts)
-        store.log_feedback({"user": actor, "value": value, "thread_ts": thread_ts, "message_ts": message_ts})
+        store.log_feedback({
+            "user": actor,
+            "value": value,
+            "polarity": polarity,
+            "thread_ts": thread_ts,
+            "message_ts": message_ts,
+        })
+
+        if polarity in {"negative", "bad"} and body.get("trigger_id") and thread_ts:
+            try:
+                client.views_open(
+                    trigger_id=body["trigger_id"],
+                    view=slackfmt.build_feedback_modal(
+                        thread_ts=thread_ts,
+                        channel=channel,
+                        message_ts=message_ts,
+                    ),
+                )
+            except Exception as e:
+                log.debug("feedback modal open failed: %s", e)
+            return
+
+        if channel and message_ts:
+            try:
+                client.reactions_add(channel=channel, timestamp=message_ts, name="+1")
+            except Exception as e:
+                log.debug("feedback acknowledgement reaction failed: %s", e)
+
+    @app.view("telly_feedback_modal")
+    def on_feedback_modal(ack, body, client):
+        ack()
+        actor = body.get("user", {}).get("id", "")
+        if not _allowed(actor):
+            return
+        view = body.get("view") or {}
+        parsed = slackfmt.parse_feedback_modal_submission(view)
+        log.info(
+            "feedback modal from %s category=%s thread=%s",
+            actor,
+            parsed.get("category"),
+            parsed.get("thread_ts"),
+        )
+        store.log_feedback({
+            "user": actor,
+            "value": "negative",
+            "polarity": "negative",
+            "category": parsed.get("category"),
+            "notes": parsed.get("notes"),
+            "thread_ts": parsed.get("thread_ts"),
+            "message_ts": parsed.get("message_ts"),
+            "source": "modal",
+        })
+        channel = parsed.get("channel")
+        message_ts = parsed.get("message_ts")
         if channel and message_ts:
             try:
                 client.reactions_add(channel=channel, timestamp=message_ts, name="memo")
             except Exception as e:
-                log.debug("feedback acknowledgement reaction failed: %s", e)
+                log.debug("feedback modal reaction failed: %s", e)
+
+    @app.action("telly_confirm_approve")
+    def on_confirm_approve(ack, body, client):
+        ack()
+        actor = body.get("user", {}).get("id", "")
+        if not _allowed(actor):
+            return
+        action = (body.get("actions") or [{}])[0]
+        raw = action.get("value") or ""
+        thread_ts, _, summary = raw.partition("|")
+        channel = body.get("channel", {}).get("id")
+        message_ts = body.get("message", {}).get("ts")
+        if not channel or not thread_ts:
+            return
+        # Disable buttons by updating the message
+        try:
+            if message_ts:
+                client.chat_update(
+                    channel=channel,
+                    ts=message_ts,
+                    text=f":white_check_mark: Approved by <@{actor}>: {summary or 'action'}",
+                    blocks=[{
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f":white_check_mark: *Approved* by <@{actor}>\n{summary or 'Proceeding.'}",
+                        },
+                    }],
+                )
+        except Exception as e:
+            log.debug("confirm approve message update failed: %s", e)
+        prompt = (
+            f"[Slack permission] <@{actor}> clicked *Approve* for this action:\n"
+            f"{summary or 'the pending action'}\n\n"
+            "Proceed with the approved action now. Do not ask for confirmation again for this step. "
+            "Report what you did when finished."
+        )
+        log.info("permission APPROVED by %s thread=%s", actor, thread_ts)
+        _kickoff(cfg, store, client, channel, thread_ts, None, actor, prompt)
+
+    @app.action("telly_confirm_deny")
+    def on_confirm_deny(ack, body, client):
+        ack()
+        actor = body.get("user", {}).get("id", "")
+        if not _allowed(actor):
+            return
+        action = (body.get("actions") or [{}])[0]
+        raw = action.get("value") or ""
+        thread_ts, _, summary = raw.partition("|")
+        channel = body.get("channel", {}).get("id")
+        message_ts = body.get("message", {}).get("ts")
+        if not channel or not thread_ts:
+            return
+        try:
+            if message_ts:
+                client.chat_update(
+                    channel=channel,
+                    ts=message_ts,
+                    text=f":no_entry_sign: Denied by <@{actor}>: {summary or 'action'}",
+                    blocks=[{
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f":no_entry_sign: *Denied* by <@{actor}>\n{summary or 'Action cancelled.'}",
+                        },
+                    }],
+                )
+        except Exception as e:
+            log.debug("confirm deny message update failed: %s", e)
+        prompt = (
+            f"[Slack permission] <@{actor}> clicked *Deny* for this action:\n"
+            f"{summary or 'the pending action'}\n\n"
+            "Do NOT perform that action. Acknowledge briefly that it was cancelled."
+        )
+        log.info("permission DENIED by %s thread=%s", actor, thread_ts)
+        _kickoff(cfg, store, client, channel, thread_ts, None, actor, prompt)
+
+    @app.action("telly_delete_message")
+    def on_delete_message(ack, body, client):
+        ack()
+        actor = body.get("user", {}).get("id", "")
+        if not _allowed(actor):
+            return
+        channel = body.get("channel", {}).get("id")
+        message_ts = body.get("message", {}).get("ts")
+        if channel and message_ts:
+            try:
+                client.chat_delete(channel=channel, ts=message_ts)
+            except Exception as e:
+                log.debug("delete message failed: %s", e)
+
+    @app.action("telly_overflow")
+    def on_overflow(ack, body, client):
+        ack()
+        actor = body.get("user", {}).get("id", "")
+        if not _allowed(actor):
+            return
+        action = (body.get("actions") or [{}])[0]
+        selected = (action.get("selected_option") or {}).get("value") or ""
+        channel = body.get("channel", {}).get("id")
+        if ":" not in selected:
+            return
+        kind, thread_ts = selected.split(":", 1)
+        if kind == "stop" and thread_ts:
+            killed = brain.cancel_thread(thread_ts)
+            if killed:
+                store.update(thread_ts, status="cancelled")
+            if channel:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text="Stopped." if killed else "(nothing running for that thread)",
+                )
+        elif kind == "fork" and thread_ts:
+            brain.fork_thread(thread_ts)
+            store.update(thread_ts, session_id=None, status="forked")
+            if channel:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=":fork_and_knife: Forked — next message starts a fresh conversation.",
+                )
+        elif kind == "list_triggers" and thread_ts and channel:
+            state = store.get(thread_ts)
+            triggers = (state.triggers if state else None) or {}
+            if not triggers:
+                text = "No triggers on this thread."
+            else:
+                lines = [f"• *{name}*: {payload.get('instruction', '')[:120]}" for name, payload in triggers.items()]
+                text = "Triggers:\n" + "\n".join(lines)
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        elif kind == "home" and actor:
+            try:
+                client.views_publish(user_id=actor, view=slackfmt.build_home_view(store.list_recent()))
+            except Exception as e:
+                log.debug("overflow home publish failed: %s", e)
 
     @app.action("telly_regenerate")
     def on_regenerate(ack, body, client):
