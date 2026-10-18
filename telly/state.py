@@ -20,6 +20,7 @@ class ThreadState:
     status: str = "idle"
     uploaded_files: list[str] = field(default_factory=list)
     triggers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    video_stream_id: str | None = None
     updated_at: float = field(default_factory=time.time)
 
 

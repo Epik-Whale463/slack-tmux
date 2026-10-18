@@ -1,10 +1,11 @@
 from pathlib import Path
+import json
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from telly.browser import BrowserError, _default_profile_dir, _ensure_profile_available, _list_sessions, _load_steps, _page_title, _profile_dir, _session_profile_dir, _text_from_dom, _viewport, build_parser, capability_text, playwright_mcp_config
+from telly.browser import DEFAULT_REMOTE_DEBUGGING_PORT, BrowserError, _default_profile_dir, _ensure_profile_available, _list_sessions, _load_steps, _page_title, _profile_dir, _session_profile_dir, _text_from_dom, _viewport, build_parser, capability_text, playwright_mcp_config, remote_debugging_port
 
 
 class BrowserTest(unittest.TestCase):
@@ -27,18 +28,30 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("user's normal Chrome profile", text)
 
     def test_playwright_mcp_config_for_opencode(self):
-        config = playwright_mcp_config("opencode")
-
-        self.assertEqual(config["type"], "local")
-        self.assertEqual(config["command"][:3], ["npx", "-y", "@playwright/mcp@latest"])
-        self.assertIn("--browser=chrome", config["command"])
-        self.assertTrue(any(arg.startswith("--user-data-dir=") for arg in config["command"]))
+        with tempfile.TemporaryDirectory() as tmp, patch("telly.browser.MCP_OUTPUT_DIR", tmp):
+            config = playwright_mcp_config("opencode")
+            self.assertEqual(config["type"], "local")
+            self.assertEqual(config["command"][:3], ["npx", "-y", "@playwright/mcp@latest"])
+            self.assertIn("--config", config["command"])
+            self.assertNotIn(f"--args=--remote-debugging-port={DEFAULT_REMOTE_DEBUGGING_PORT}", config["command"])
+            config_path = Path(config["command"][config["command"].index("--config") + 1])
+            mcp_config = json.loads(config_path.read_text())
+            self.assertIn(f"--remote-debugging-port={DEFAULT_REMOTE_DEBUGGING_PORT}", mcp_config["browser"]["launchOptions"]["args"])
+            self.assertEqual(mcp_config["capabilities"], ["core", "pdf", "devtools"])
 
     def test_playwright_mcp_config_for_claude(self):
-        config = playwright_mcp_config("claude")
+        with tempfile.TemporaryDirectory() as tmp, patch("telly.browser.MCP_OUTPUT_DIR", tmp):
+            config = playwright_mcp_config("claude")
+            self.assertEqual(config["command"], "npx")
+            self.assertEqual(config["args"][:2], ["-y", "@playwright/mcp@latest"])
+            self.assertIn("--config", config["args"])
 
-        self.assertEqual(config["command"], "npx")
-        self.assertEqual(config["args"][:2], ["-y", "@playwright/mcp@latest"])
+    def test_remote_debugging_port_env_override(self):
+        with patch.dict(os.environ, {"TELLY_BROWSER_REMOTE_DEBUGGING_PORT": "9333"}):
+            self.assertEqual(remote_debugging_port(), 9333)
+
+        with patch.dict(os.environ, {"TELLY_BROWSER_REMOTE_DEBUGGING_PORT": "off"}):
+            self.assertIsNone(remote_debugging_port())
 
     def test_parser_accepts_screenshot_output(self):
         args = build_parser().parse_args(["screenshot", "https://example.com", "--output", "out.png"])

@@ -1,0 +1,43 @@
+# Slack app manifest hints for Telly's agent experience.
+# Apply corresponding settings in https://api.slack.com/apps (Agents feature).
+#
+# New apps should use agent_view. Existing assistant_view apps can migrate once
+# ready — the switch is irreversible in the Slack UI.
+#
+# features:
+#   agent:
+#     view:
+#       agent_view: true
+#     # or legacy:
+#     # view:
+#     #   assistant_view: true
+#
+# Required scopes (minimum):
+#   - assistant:write
+#   - chat:write
+#   - im:history
+#   - channels:history (if @mention in channels)
+#   - app_mentions:read
+#   - reactions:write
+#   - files:write
+#   - files:read
+#
+# Event subscriptions:
+#   agent_view:
+#     - app_home_opened
+#     - app_context_changed
+#     - message.im
+#     - app_mention
+#     - message_stream_stopped   # for is_stoppable streams
+#     - reaction_added
+#   assistant_view (legacy, still handled):
+#     - assistant_thread_started
+#     - assistant_thread_context_changed
+#     - message.im
+#
+# Telly uses:
+#   - chat.startStream / chat.appendStream / chat.stopStream (task_display_mode=plan)
+#   - assistant.threads.setStatus (+ loading_messages)
+#   - assistant.threads.setTitle
+#   - assistant.threads.setSuggestedPrompts
+#   - markdown / table / plan / task_card / data_visualization / context_actions blocks
