@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from telly.browser import DEFAULT_REMOTE_DEBUGGING_PORT, BrowserError, _default_profile_dir, _ensure_profile_available, _list_sessions, _load_steps, _page_title, _profile_dir, _session_profile_dir, _text_from_dom, _viewport, build_parser, capability_text, playwright_mcp_config, remote_debugging_port
+from telly.browser import DEFAULT_REMOTE_DEBUGGING_PORT, BrowserError, _chrome_candidates, _default_profile_dir, _ensure_profile_available, _list_sessions, _load_steps, _page_title, _profile_dir, _session_profile_dir, _text_from_dom, _viewport, build_parser, capability_text, chrome_path, playwright_mcp_config, remote_debugging_port
 
 
 class BrowserTest(unittest.TestCase):
@@ -139,6 +139,32 @@ class BrowserTest(unittest.TestCase):
 
     def test_viewport_parsing(self):
         self.assertEqual(_viewport("390,844"), {"width": 390, "height": 844})
+
+
+class ChromePathTest(unittest.TestCase):
+    def test_env_override_wins(self):
+        with patch.dict(os.environ, {"TELLY_CHROME_PATH": "/opt/my/chrome"}):
+            self.assertEqual(chrome_path(), "/opt/my/chrome")
+
+    def test_falls_back_to_known_absolute_location(self):
+        path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TELLY_CHROME_PATH", None)
+            with patch("telly.browser.shutil.which", return_value=None), patch(
+                "telly.browser._chrome_candidates", return_value=[path]
+            ), patch("telly.browser.Path.is_file", return_value=True):
+                self.assertEqual(chrome_path(), path)
+
+    def test_none_when_nothing_found(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TELLY_CHROME_PATH", None)
+            with patch("telly.browser.shutil.which", return_value=None), patch(
+                "telly.browser._chrome_candidates", return_value=[]
+            ):
+                self.assertIsNone(chrome_path())
+
+    def test_candidates_helper_returns_a_list(self):
+        self.assertIsInstance(_chrome_candidates(), list)
 
 
 if __name__ == "__main__":

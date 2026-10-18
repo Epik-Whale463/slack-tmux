@@ -2,7 +2,6 @@ import logging
 import re
 import threading
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -15,7 +14,6 @@ from . import brain, slackfmt
 from .agent_stream import AgentReplyStream, LOADING_MESSAGES
 from .config import Config
 from .state import ThreadStore
-from .video_stream import get_stream_server, VideoStreamSession, STREAM_HOST, STREAM_PORT
 
 log = logging.getLogger(__name__)
 
@@ -532,8 +530,6 @@ def _format_upload_failure(path: Path, err: Exception) -> str:
 def _build_final_message_parts(
     turn: brain.BrainTurn,
     thread_ts: str,
-    *,
-    live_browser_url: str | None = None,
 ) -> tuple[str, str, list[dict], list[dict], list[dict], list[Path], str, str | None]:
     """Return display_md, notify, trailing, legacy, fallback, uploads, full_md, confirm_summary."""
     reply, upload_paths = _extract_upload_markers(turn.reply)
@@ -553,62 +549,30 @@ def _build_final_message_parts(
     markdown_text = (reply or empty_placeholder).strip()
     notify_text = slackfmt.to_mrkdwn(markdown_text)
 
-    breadcrumbs_block = slackfmt.build_breadcrumb_block(turn.tool_breadcrumbs)
-    footer_block = slackfmt.build_footer_block(turn.session_id, turn.cost_usd, turn.duration_ms)
-    # When awaiting permission, only show Approve/Deny — not regenerate/fork noise
+    # Answer-first layout: no status banner, no duplicate completion cards.
+    # Controls (feedback / actions) and citations sit quietly under the answer.
     actions_block = None if confirm_summary else slackfmt.build_actions_block(thread_ts)
     feedback_block = None if confirm_summary else slackfmt.build_feedback_block(thread_ts)
     tool_events = turn.tool_events or turn.tool_breadcrumbs
-    sources = slackfmt.collect_task_sources(tool_events, live_browser_url=live_browser_url)
-    file_paths = slackfmt.file_paths_from_tool_events(tool_events)
-    completion_block = slackfmt.build_completion_task_block(
-        thread_ts,
-        turn.duration_ms,
-        sources=sources,
-        file_paths=file_paths,
-    )
-
-    # Message-safe leading chrome (never use modal-only alert in messages)
-    leading: list[dict] = []
-    if confirm_summary:
-        leading.extend(slackfmt.build_permission_blocks(thread_ts, confirm_summary))
-    else:
-        leading.append(slackfmt.build_message_status_block("Response ready.", level="success"))
-        try:
-            leading.append(slackfmt.build_completion_card(
-                thread_ts, turn.duration_ms, sources=sources, file_paths=file_paths,
-            ))
-        except (TypeError, ValueError):
-            pass
+    sources = slackfmt.collect_task_sources(tool_events)
 
     display_markdown = markdown_text
     if len(markdown_text) > LONG_REPLY_FILE_THRESHOLD:
         display_markdown = "The answer was long, so I attached the full response as a Markdown file."
 
-    trailing_blocks = slackfmt.sanitize_blocks_for_messages(
-        leading + slackfmt.build_blocks(
-            "",
-            completion_block=None if confirm_summary else completion_block,
-            breadcrumbs_block=breadcrumbs_block,
-            content_blocks=content_blocks,
-            actions_block=actions_block,
-            feedback_block=feedback_block,
-            footer=footer_block,
-        )
-    )
-    legacy_blocks = slackfmt.sanitize_blocks_for_messages(
-        leading + slackfmt.build_blocks(
-            display_markdown,
-            completion_block=None if confirm_summary else completion_block,
-            breadcrumbs_block=breadcrumbs_block,
-            content_blocks=content_blocks,
-            actions_block=actions_block,
-            feedback_block=feedback_block,
-            footer=footer_block,
-        )
-    )
-    # Ultra-safe fallback: section + permission buttons OR section + actions
+    trailing_content = list(content_blocks)
+    sources_block = slackfmt.build_sources_block(sources)
+    if sources_block:
+        trailing_content.append(sources_block)
+
     if confirm_summary:
+        # Permission UI leads; the ask is streamed as markdown and the
+        # Approve/Deny controls sit underneath. No regenerate/fork noise.
+        leading = slackfmt.build_permission_blocks(thread_ts, confirm_summary)
+        trailing_blocks = slackfmt.sanitize_blocks_for_messages(leading)
+        legacy_blocks = slackfmt.sanitize_blocks_for_messages(
+            leading + slackfmt.build_blocks(display_markdown)
+        )
         legacy_fallback = slackfmt.build_permission_blocks(thread_ts, confirm_summary)
         if display_markdown:
             legacy_fallback = [
@@ -620,11 +584,25 @@ def _build_final_message_parts(
                 *legacy_fallback,
             ]
     else:
+        trailing_blocks = slackfmt.sanitize_blocks_for_messages(
+            slackfmt.build_blocks(
+                "",
+                content_blocks=trailing_content,
+                actions_block=actions_block,
+                feedback_block=feedback_block,
+            )
+        )
+        legacy_blocks = slackfmt.sanitize_blocks_for_messages(
+            slackfmt.build_blocks(
+                display_markdown,
+                content_blocks=trailing_content,
+                actions_block=actions_block,
+                feedback_block=feedback_block,
+            )
+        )
         legacy_fallback = slackfmt.build_blocks(
             display_markdown,
-            breadcrumbs_block=breadcrumbs_block,
             actions_block=slackfmt.build_actions_block(thread_ts),
-            footer=footer_block,
             use_markdown_block=False,
         )
     return (
@@ -655,8 +633,6 @@ def _finalize_reply(
     thread_ts: str,
     reply_stream: AgentReplyStream | None,
     turn: brain.BrainTurn,
-    *,
-    live_browser_url: str | None = None,
 ) -> None:
     (
         display_markdown,
@@ -667,7 +643,7 @@ def _finalize_reply(
         upload_paths,
         full_markdown,
         confirm_summary,
-    ) = _build_final_message_parts(turn, thread_ts, live_browser_url=live_browser_url)
+    ) = _build_final_message_parts(turn, thread_ts)
 
     if len(full_markdown) > LONG_REPLY_FILE_THRESHOLD:
         _try_upload_long_reply(client, channel, thread_ts, full_markdown)
@@ -716,27 +692,6 @@ def _finalize_reply(
                     continue
 
 
-def _is_browser_task(text: str) -> bool:
-    """Detect if the prompt likely involves browser automation."""
-    keywords = (
-        "browser", "navigate", "visit", "screenshot", "click", "fill", "form",
-        "web", "page", "link", "url", "scrape", "automat", "interact", "submit"
-    )
-    text_lower = text.lower()
-    return any(keyword in text_lower for keyword in keywords)
-
-
-def _build_live_browser_instruction(stream_id: str) -> str:
-    """Build instruction for agent-visible live browser sharing."""
-    return (
-        f"[Live Browser Sharing] A live browser feed is already prepared for this task.\n"
-        f"Use the available Playwright MCP tools or `telly.browser` CLI normally; telly captures the active Chrome page through remote debugging.\n"
-        f"Do not call `browser_start_video`, `browser_video_show_actions`, or `browser_stop_video`; current Playwright MCP does not expose those tools.\n"
-        f"The live feed is at: http://{STREAM_HOST}:{STREAM_PORT}/stream/{stream_id}\n"
-        f"Keep the browser page active while doing visible browser work so the user can watch it live."
-    )
-
-
 def _handle_brain_turn(
     cfg: Config,
     store: ThreadStore,
@@ -763,33 +718,6 @@ def _handle_brain_turn(
         loading_messages=LOADING_MESSAGES,
     )
 
-    # Detect browser tasks and start video streaming
-    stream_id = prior.video_stream_id if prior and _is_browser_task(text) else None
-    stream_session = None
-    live_browser_url: str | None = None
-    if _is_browser_task(text):
-        if stream_id is None:
-            stream_id = str(uuid.uuid4())[:12]
-            store.update(thread_ts, video_stream_id=stream_id)
-        try:
-            stream_session = VideoStreamSession(stream_id, task_name=text[:60])
-            stream_session.start()
-            live_browser_url = stream_session.get_url()
-            store.update(thread_ts, video_stream_id=stream_id)
-            try:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=f"🎬 *Live browser session:* <{live_browser_url}|Watch live>",
-                )
-            except Exception as e:
-                log.warning("Failed to post video stream link: %s", e)
-        except Exception as e:
-            log.warning("Failed to start video streaming: %s", e)
-            stream_id = None
-            stream_session = None
-            live_browser_url = None
-
     reply_stream: AgentReplyStream | None = None
     if not background:
         reply_stream = AgentReplyStream(
@@ -798,8 +726,7 @@ def _handle_brain_turn(
             thread_ts=thread_ts,
             user_id=user_id,
             team_id=team_id,
-            task_display_mode="plan",
-            live_browser_url=live_browser_url,
+            task_display_mode="timeline",
         )
         reply_stream.start()
         if reply_stream.stream_ts or reply_stream.legacy_placeholder_ts:
@@ -839,13 +766,6 @@ def _handle_brain_turn(
             except Exception:
                 log.exception("error post failed")
         return
-    finally:
-        if stream_session:
-            try:
-                stream_session.stop()
-                stream_session.cleanup(delay_s=5.0)
-            except Exception as e:
-                log.debug("Error during video stream cleanup: %s", e)
 
     if turn.reply.strip() == NO_REPLY_TOKEN:
         log.info("brain returned NO_REPLY — staying silent")
@@ -867,7 +787,6 @@ def _handle_brain_turn(
         thread_ts,
         reply_stream,
         turn,
-        live_browser_url=live_browser_url,
     )
 
 
@@ -889,13 +808,8 @@ def _kickoff(
     context_note = _fetch_discussion_context(client, channel, thread_ts, msg_ts) if _wants_discussion_context(text) else None
     state = store.get(thread_ts)
     trigger_note = _format_trigger_note(state.triggers if state else None)
-    is_browser_task = _is_browser_task(text)
-    stream_id = str(uuid.uuid4())[:12] if is_browser_task else None
 
     notes = [context_note, trigger_note]
-    if stream_id:
-        notes.append(_build_live_browser_instruction(stream_id))
-
     prompt = _augment_prompt(text, file_paths or [], "\n\n".join(note for note in notes if note))
     store.update(
         thread_ts,
@@ -904,7 +818,6 @@ def _kickoff(
         last_message=text,
         agent_cmd=cfg.main_agent_cmd,
         uploaded_files=file_paths or None,
-        video_stream_id=stream_id,
         status="queued",
     )
     _set_title(client, channel, thread_ts, text)
@@ -936,9 +849,6 @@ def build_app(cfg: Config) -> App:
     store = ThreadStore(cfg.telly_home)
     brain.restore_sessions(store.session_map())
     _start_background_trigger_loop(cfg, store, app.client)
-
-    # Start video streaming server for browser tasks
-    get_stream_server().start()
 
     def _allowed(user_id: str) -> bool:
         return not cfg.allowed_slack_user_ids or user_id in cfg.allowed_slack_user_ids

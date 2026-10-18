@@ -989,13 +989,9 @@ def _source_label(url: str) -> str:
 
 def collect_task_sources(
     tool_events: list[dict] | None = None,
-    *,
-    live_browser_url: str | None = None,
 ) -> list[dict]:
-    """Build URL source elements from tool events and optional live browser feed."""
+    """Build URL source elements from tool events."""
     sources: list[dict] = []
-    if live_browser_url and _is_http_url(live_browser_url):
-        sources.append({"type": "url", "url": live_browser_url, "text": "Live browser"})
 
     for event in tool_events or []:
         tool_input = event.get("input") if isinstance(event.get("input"), dict) else {}
@@ -1256,21 +1252,13 @@ def _validate_series(series: object, categories: list[str]) -> list[dict]:
     return validated
 
 
-def build_footer_block(session_id: str | None, cost_usd: float | None, duration_ms: int | None) -> dict | None:
-    """Return a Slack `context` block summarizing the turn, or None if no metadata."""
-    parts: list[str] = []
-    if session_id:
-        parts.append(f"session `{session_id[:8]}`")
-    if cost_usd is not None:
-        parts.append(f"${cost_usd:.4f}")
-    if duration_ms is not None:
-        parts.append(f"{duration_ms / 1000:.1f}s")
-    if not parts:
+def build_sources_block(sources: list[dict] | None) -> dict | None:
+    """Compact citations row for the foot of a reply: `Sources · <link> · <link>`."""
+    validated = _validate_sources(sources or [])
+    if not validated:
         return None
-    return {
-        "type": "context",
-        "elements": [{"type": "mrkdwn", "text": " · ".join(parts)}],
-    }
+    links = " · ".join(f"<{s['url']}|{s['text']}>" for s in validated)
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Sources · {links}"}]}
 
 
 def _truncate(value: object, limit: int = 100) -> str:
@@ -1278,23 +1266,11 @@ def _truncate(value: object, limit: int = 100) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-# Tools whose calls are pure exploration — hidden from the Slack trace.
-_NOISY_TOOLS = {"Read", "Glob", "Grep"}
-# Bash invocations whose first token is one of these are also pure exploration.
+# Bash invocations whose first token is one of these are pure exploration.
 _NOISY_BASH_CMDS = {
     "ls", "cat", "head", "tail", "pwd", "which", "find", "grep", "rg",
     "wc", "stat", "file", "du", "df", "tree", "echo", "printf",
 }
-
-
-def _is_noisy(name: str, tool_input: dict) -> bool:
-    if name in _NOISY_TOOLS:
-        return True
-    if name == "Bash":
-        cmd = (tool_input.get("command") or "").lstrip()
-        first = cmd.split(maxsplit=1)[0] if cmd else ""
-        return first in _NOISY_BASH_CMDS
-    return False
 
 
 def format_breadcrumb(name: str, tool_input: dict) -> str:
@@ -1318,48 +1294,6 @@ def format_breadcrumb(name: str, tool_input: dict) -> str:
     # Generic fallback
     first_val = next(iter(tool_input.values()), "") if tool_input else ""
     return f"{name} `{_truncate(first_val)}`"
-
-
-_MAX_BREADCRUMBS = 4
-
-
-def build_breadcrumb_block(breadcrumbs: list[dict]) -> dict | None:
-    """Render tool calls as a single Slack `context` block above the reply.
-
-    Filters out read-only exploration (Read/Glob/Grep, plus `ls`/`cat`-style
-    Bash) and collapses consecutive same-tool calls into `… ×N`. Full trace
-    is preserved in the turn jsonl regardless.
-    """
-    if not breadcrumbs:
-        return None
-
-    visible = [c for c in breadcrumbs if not _is_noisy(c["name"], c["input"])]
-    hidden = len(breadcrumbs) - len(visible)
-
-    collapsed: list[tuple[str, int]] = []
-    for crumb in visible:
-        rendered = format_breadcrumb(crumb["name"], crumb["input"])
-        if collapsed and collapsed[-1][0] == rendered:
-            text, n = collapsed[-1]
-            collapsed[-1] = (text, n + 1)
-        else:
-            collapsed.append((rendered, 1))
-
-    elements: list[dict] = []
-    for text, n in collapsed[:_MAX_BREADCRUMBS]:
-        elements.append({"type": "mrkdwn", "text": text if n == 1 else f"{text} ×{n}"})
-    overflow = len(collapsed) - _MAX_BREADCRUMBS
-    extras: list[str] = []
-    if overflow > 0:
-        extras.append(f"+{overflow} more")
-    if hidden > 0:
-        extras.append(f"+{hidden} read")
-    if extras:
-        elements.append({"type": "mrkdwn", "text": f"_{' · '.join(extras)}_"})
-
-    if not elements:
-        return None
-    return {"type": "context", "elements": elements}
 
 
 _TOOL_ICONS = {
@@ -1395,8 +1329,6 @@ def build_activity_blocks(
     thread_ts: str,
     tool_events: list[dict] | None = None,
     partial_text: str = "",
-    *,
-    live_browser_url: str | None = None,
 ) -> list[dict]:
     """Build the in-flight Slack agent card with live activity details."""
     events = tool_events or []
@@ -1425,7 +1357,7 @@ def build_activity_blocks(
     if partial_text.strip():
         details = details + "\n\n" + _truncate(to_mrkdwn(partial_text.strip())[-1200:], 1200)
 
-    sources = collect_task_sources(events, live_browser_url=live_browser_url)
+    sources = collect_task_sources(events)
     work_task: dict = {
         "task_id": f"{_safe_id(thread_ts)}_work",
         "title": f"{phase_icon} {phase}",
@@ -1503,56 +1435,6 @@ def build_plain_loading_blocks(thread_ts: str) -> list[dict]:
         {"type": "context", "elements": [{"type": "mrkdwn", "text": "Posting the complete answer when ready."}]},
         build_stop_actions_block(thread_ts),
     ]
-
-
-def build_completion_task_block(
-    thread_ts: str,
-    duration_ms: int | None,
-    *,
-    sources: list[dict] | None = None,
-    file_paths: list[str] | None = None,
-) -> dict:
-    sid = _safe_id(thread_ts)
-    detail = "Complete answer generated."
-    if duration_ms is not None:
-        detail = f"Complete answer generated in {duration_ms / 1000:.1f}s."
-    if file_paths:
-        shown = ", ".join(f"`{_truncate(p, 50)}`" for p in file_paths[:3])
-        detail = f"{detail} Files: {shown}"
-    block: dict = {
-        "type": "task_card",
-        "task_id": f"{sid}_complete",
-        "title": "Telly response ready",
-        "status": "complete",
-        "output": _rich_text(detail),
-    }
-    validated = _validate_sources(sources or [])
-    if validated:
-        block["sources"] = validated
-    return block
-
-
-def build_completion_card(
-    thread_ts: str,
-    duration_ms: int | None,
-    *,
-    sources: list[dict] | None = None,
-    file_paths: list[str] | None = None,
-) -> dict:
-    """Friendly card summary shown above the answer body (message-safe card)."""
-    detail = "Answer ready."
-    if duration_ms is not None:
-        detail = f"Finished in {duration_ms / 1000:.1f}s."
-    if file_paths:
-        detail += f" Touched {len(file_paths)} file(s)."
-    if sources:
-        detail += f" {len(sources)} source(s)."
-    return build_card_block(
-        title="Telly response",
-        subtitle=_truncate(thread_ts, 150),
-        body=_truncate(detail, 200),
-        block_id=f"telly_complete_card_{_safe_id(thread_ts)}",
-    )
 
 
 def build_feedback_block(thread_ts: str) -> dict:

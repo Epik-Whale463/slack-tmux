@@ -87,14 +87,46 @@ class BrowserError(RuntimeError):
     pass
 
 
+_CHROME_PATH_NAMES = ("google-chrome", "chromium", "chromium-browser", "chrome")
+
+
+def _chrome_candidates() -> list[str]:
+    """Well-known absolute Chrome/Chromium locations that are usually not on PATH."""
+    if sys.platform == "darwin":
+        bases = ["/Applications", str(Path.home() / "Applications")]
+        apps = (
+            "Google Chrome.app/Contents/MacOS/Google Chrome",
+            "Chromium.app/Contents/MacOS/Chromium",
+            "Brave Browser.app/Contents/MacOS/Brave Browser",
+            "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        )
+        return [str(Path(base) / app) for base in bases for app in apps]
+    if sys.platform == "win32":
+        candidates: list[str] = []
+        for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            base = os.environ.get(env)
+            if not base:
+                continue
+            candidates += [
+                str(Path(base) / "Google/Chrome/Application/chrome.exe"),
+                str(Path(base) / "Chromium/Application/chrome.exe"),
+                str(Path(base) / "Microsoft/Edge/Application/msedge.exe"),
+            ]
+        return candidates
+    return []
+
+
 def chrome_path() -> str | None:
     env_path = os.environ.get("TELLY_CHROME_PATH")
     if env_path:
         return env_path
-    for name in ("google-chrome", "chromium", "chromium-browser", "chrome"):
+    for name in _CHROME_PATH_NAMES:
         path = shutil.which(name)
         if path:
             return path
+    for candidate in _chrome_candidates():
+        if Path(candidate).is_file():
+            return candidate
     return None
 
 

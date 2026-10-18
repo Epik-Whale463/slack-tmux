@@ -44,7 +44,7 @@ def _clip(text: str, limit: int) -> str:
     return text[: max(0, limit - 1)] + "…"
 
 
-def tool_event_to_task_chunk(event: dict, *, live_browser_url: str | None = None) -> dict:
+def tool_event_to_task_chunk(event: dict) -> dict:
     """Map one brain tool_event into a chat stream task_update chunk."""
     name = str(event.get("name") or "tool")
     tool_input = event.get("input") if isinstance(event.get("input"), dict) else {}
@@ -68,37 +68,24 @@ def tool_event_to_task_chunk(event: dict, *, live_browser_url: str | None = None
         "title": title,
         "status": slack_status,
     }
-    detail_bits = [title]
-    if live_browser_url and (
-        "browser" in name.lower()
-        or name.startswith("playwright")
-        or "WebFetch" in name
-    ):
-        detail_bits.append(f"live: {live_browser_url}")
-    chunk["details"] = _clip(" · ".join(detail_bits), TASK_DETAIL_LIMIT)
+    chunk["details"] = _clip(title, TASK_DETAIL_LIMIT)
 
-    sources = slackfmt.collect_task_sources([event], live_browser_url=live_browser_url)
+    sources = slackfmt.collect_task_sources([event])
     if sources:
         chunk["sources"] = sources
     return chunk
 
 
 def build_plan_seed_chunks(thread_ts: str) -> list[dict]:
+    """Single in-progress step so the timeline shows activity immediately."""
     sid = _safe_task_id(thread_ts, "thread")
     return [
-        {
-            "type": "task_update",
-            "id": f"{sid}_understand",
-            "title": "Understand the Slack request",
-            "status": "complete",
-            "output": "Thread context received.",
-        },
         {
             "type": "task_update",
             "id": f"{sid}_work",
             "title": "Working on your request",
             "status": "in_progress",
-            "details": "Preparing the local agent and workspace.",
+            "details": "Spinning up the local agent…",
         },
     ]
 
@@ -112,8 +99,7 @@ class AgentReplyStream:
     thread_ts: str
     user_id: str | None = None
     team_id: str | None = None
-    task_display_mode: str = "plan"
-    live_browser_url: str | None = None
+    task_display_mode: str = "timeline"
 
     stream_ts: str | None = None
     legacy_placeholder_ts: str | None = None
@@ -261,18 +247,18 @@ class AgentReplyStream:
                         self.thread_ts,
                         tool_events,
                         partial_text,
-                        live_browser_url=self.live_browser_url,
                     ),
                 )
             except Exception:
                 log.debug("legacy progress chat.update failed", exc_info=True)
 
     def _stream_progress(self, tool_events: list[dict], partial_text: str) -> None:
-        # Stream only task updates during work. Full answer markdown is sent on stopStream
+        # Timeline mode: each tool call is its own step that moves
+        # in_progress → complete. Full answer markdown is sent on stopStream
         # so we never risk duplicated partial drafts.
         chunks: list[dict] = []
         for event in tool_events:
-            chunk = tool_event_to_task_chunk(event, live_browser_url=self.live_browser_url)
+            chunk = tool_event_to_task_chunk(event)
             task_id = chunk["id"]
             prev = self._task_state.get(task_id)
             if prev == chunk["status"] and prev is not None:
@@ -281,42 +267,20 @@ class AgentReplyStream:
             self._task_state[task_id] = chunk["status"]
             chunks.append(chunk)
 
-        if tool_events:
-            current = next((e for e in reversed(tool_events) if e.get("status") == "running"), tool_events[-1])
-            phase_icon, phase = slackfmt.phase_for_tool(
-                str(current.get("name") or ""),
-                str(current.get("status") or ""),
-            )
+        # Before any tool call fires, show the draft on the seed work step so
+        # the timeline isn't empty while the model thinks.
+        if not tool_events and partial_text.strip():
             work_id = f"{_safe_task_id(self.thread_ts, 'thread')}_work"
-            work_key = f"{phase}|{current.get('status') or 'running'}"
-            work_chunk = {
-                "type": "task_update",
-                "id": work_id,
-                "title": _clip(f"{phase_icon} {phase}", TASK_TITLE_LIMIT),
-                "status": "in_progress",
-                "details": _clip(slackfmt.format_breadcrumb(
-                    str(current.get("name") or "tool"),
-                    current.get("input") if isinstance(current.get("input"), dict) else {},
-                ), TASK_DETAIL_LIMIT),
-            }
-            sources = slackfmt.collect_task_sources(tool_events, live_browser_url=self.live_browser_url)
-            if sources:
-                work_chunk["sources"] = sources
-            if self._task_state.get(work_id) != work_key:
-                self._task_state[work_id] = work_key
-                chunks.append(work_chunk)
-        elif partial_text.strip():
-            work_id = f"{_safe_task_id(self.thread_ts, 'thread')}_work"
-            work_chunk = {
-                "type": "task_update",
-                "id": work_id,
-                "title": "Drafting reply",
-                "status": "in_progress",
-                "details": _clip(partial_text.strip()[-200:], TASK_DETAIL_LIMIT),
-            }
-            if self._task_state.get(work_id) != work_chunk["details"]:
-                self._task_state[work_id] = work_chunk["details"]
-                chunks.append(work_chunk)
+            detail = _clip(partial_text.strip()[-200:], TASK_DETAIL_LIMIT)
+            if self._task_state.get(work_id) != detail:
+                self._task_state[work_id] = detail
+                chunks.append({
+                    "type": "task_update",
+                    "id": work_id,
+                    "title": "Drafting reply",
+                    "status": "in_progress",
+                    "details": detail,
+                })
 
         if not chunks:
             return
@@ -432,7 +396,7 @@ class AgentReplyStream:
         for event in tool_events or []:
             if str(event.get("status") or "") == "running":
                 event = {**event, "status": "done"}
-            chunk = tool_event_to_task_chunk(event, live_browser_url=self.live_browser_url)
+            chunk = tool_event_to_task_chunk(event)
             if chunk["status"] == "in_progress":
                 chunk["status"] = "complete"
             complete_chunks.append(chunk)

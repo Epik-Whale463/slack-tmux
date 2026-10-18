@@ -106,10 +106,8 @@ class TaskSourcesTest(unittest.TestCase):
                 {"name": "WebFetch", "input": {"url": "https://example.com/docs"}},
                 {"name": "playwright_browser_navigate", "input": {"url": "https://app.local/login"}},
             ],
-            live_browser_url="http://127.0.0.1:9999/stream/abc",
         )
         urls = {s["url"] for s in sources}
-        self.assertIn("http://127.0.0.1:9999/stream/abc", urls)
         self.assertIn("https://example.com/docs", urls)
         self.assertIn("https://app.local/login", urls)
 
@@ -120,24 +118,12 @@ class TaskSourcesTest(unittest.TestCase):
                 {"name": "Edit", "input": {"file_path": "/tmp/app.py"}, "status": "running"},
                 {"name": "WebFetch", "input": {"url": "https://example.com"}, "status": "done"},
             ],
-            live_browser_url="http://127.0.0.1:9999/stream/xyz",
         )
         work = blocks[0]["tasks"][1]
         self.assertIn("sources", work)
         urls = {s["url"] for s in work["sources"]}
         self.assertIn("https://example.com", urls)
-        self.assertIn("http://127.0.0.1:9999/stream/xyz", urls)
         self.assertIn("/tmp/app.py", str(work["details"]))
-
-    def test_completion_task_block_includes_sources(self):
-        block = slackfmt.build_completion_task_block(
-            "1.2",
-            1500,
-            sources=[{"type": "url", "url": "https://example.com", "text": "example.com"}],
-            file_paths=["/tmp/x.py"],
-        )
-        self.assertEqual(block["sources"][0]["url"], "https://example.com")
-        self.assertIn("/tmp/x.py", str(block["output"]))
 
 
 class FeedbackModalTest(unittest.TestCase):

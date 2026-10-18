@@ -17,23 +17,21 @@ class ToolEventChunkTest(unittest.TestCase):
         self.assertEqual(chunk["status"], "in_progress")
         self.assertIn("a.py", chunk["title"])
 
-    def test_includes_live_browser_source(self):
+    def test_includes_tool_url_source(self):
         chunk = tool_event_to_task_chunk(
-            {"id": "t2", "name": "WebFetch", "input": {"url": "https://example.com"}, "status": "done"},
-            live_browser_url="http://127.0.0.1:9999/stream/abc",
+            {"id": "t2", "name": "WebFetch", "input": {"url": "https://example.com"}, "status": "done"}
         )
         self.assertEqual(chunk["status"], "complete")
         urls = {s["url"] for s in chunk.get("sources", [])}
         self.assertIn("https://example.com", urls)
-        self.assertIn("http://127.0.0.1:9999/stream/abc", urls)
 
 
 class PlanSeedTest(unittest.TestCase):
-    def test_seed_has_understand_and_work(self):
+    def test_seed_is_a_single_work_step(self):
         chunks = build_plan_seed_chunks("123.456")
-        self.assertEqual(len(chunks), 2)
-        self.assertEqual(chunks[0]["status"], "complete")
-        self.assertEqual(chunks[1]["status"], "in_progress")
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["type"], "task_update")
+        self.assertEqual(chunks[0]["status"], "in_progress")
 
 
 class AgentReplyStreamTest(unittest.TestCase):
@@ -58,7 +56,7 @@ class AgentReplyStreamTest(unittest.TestCase):
         self.assertEqual(ts, "S.1")
         client.chat_stream.assert_called_once()
         kwargs = client.chat_stream.call_args.kwargs
-        self.assertEqual(kwargs["task_display_mode"], "plan")
+        self.assertEqual(kwargs["task_display_mode"], "timeline")
         self.assertEqual(kwargs["recipient_user_id"], "U1")
         streamer.append.assert_called()
         # stop control message posted

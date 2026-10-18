@@ -99,7 +99,6 @@ class UiBuildersTest(unittest.TestCase):
             status = "complete"
             agent_cmd = "claude"
             session_id = "abc12345"
-            video_stream_id = None
 
         view = slackfmt.build_home_view([T()])
         types = [b["type"] for b in view["blocks"]]

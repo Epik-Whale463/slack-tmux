@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,6 @@ class ThreadState:
     status: str = "idle"
     uploaded_files: list[str] = field(default_factory=list)
     triggers: dict[str, dict[str, Any]] = field(default_factory=dict)
-    video_stream_id: str | None = None
     updated_at: float = field(default_factory=time.time)
 
 
@@ -55,9 +54,9 @@ def _normalize_triggers(raw: Any) -> dict[str, dict[str, Any]]:
 
 
 class ThreadStore:
-    def __init__(self, telly_home: Path):
+    def __init__(self, telly_home: Path, filename: str = "threads.json"):
         self.root = telly_home
-        self.path = telly_home / "threads.json"
+        self.path = telly_home / filename
         self.feedback_path = telly_home / "feedback.jsonl"
         self._threads: dict[str, ThreadState] = {}
         self.load()
@@ -68,9 +67,10 @@ class ThreadStore:
                 return
             raw = json.loads(self.path.read_text())
             threads = raw.get("threads", raw)
+            valid = {f.name for f in fields(ThreadState)} - {"thread_ts"}
             for thread_ts, payload in threads.items():
                 if isinstance(payload, dict):
-                    state_payload = {k: v for k, v in payload.items() if k != "thread_ts"}
+                    state_payload = {k: v for k, v in payload.items() if k in valid}
                     state_payload["triggers"] = _normalize_triggers(state_payload.get("triggers"))
                     self._threads[thread_ts] = ThreadState(thread_ts=thread_ts, **state_payload)
         except Exception:

@@ -8,8 +8,8 @@ from telly.config import Config
 from telly.state import ThreadStore
 
 
-class AppBrowserVideoTest(unittest.TestCase):
-    def test_kickoff_reuses_same_stream_id_for_instruction_and_state(self):
+class AppKickoffTest(unittest.TestCase):
+    def test_kickoff_submits_prompt_without_live_browser_chrome(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Config(
                 slack_bot_token="x",
@@ -28,18 +28,13 @@ class AppBrowserVideoTest(unittest.TestCase):
 
             state = store.get("T123")
             self.assertIsNotNone(state)
-            self.assertIsNotNone(state.video_stream_id)
+            # The live-feed feature is gone; no stream id is tracked.
+            self.assertFalse(hasattr(state, "video_stream_id"))
             self.assertTrue(submit.called)
 
-            # kwargs form: prompt is positional arg index 8 (text/prompt)
             args = submit.call_args.args
-            kwargs = submit.call_args.kwargs
-            submitted_prompt = args[8] if len(args) > 8 else kwargs.get("text")
-            # _executor.submit(_handle_brain_turn, cfg, store, client, channel, thread_ts, msg_ts, user_id, prompt, ...)
-            self.assertIsNotNone(submitted_prompt)
-            self.assertIn(f"/stream/{state.video_stream_id}", submitted_prompt)
-            self.assertIn("Live Browser Sharing", submitted_prompt)
-            self.assertIn("Do not call `browser_start_video`", submitted_prompt)
+            submitted_prompt = args[8] if len(args) > 8 else submit.call_args.kwargs.get("text")
+            self.assertEqual(submitted_prompt, "visit example.com")
 
 
 if __name__ == "__main__":

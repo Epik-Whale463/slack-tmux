@@ -18,6 +18,15 @@ log = logging.getLogger(__name__)
 AGENT_TURN_TIMEOUT_S = 600
 ProgressCallback = Callable[[dict], None]
 
+# Command Code ships as "command-code" with a "cmd" alias; both are the same CLI.
+COMMAND_CODE_NAMES = frozenset({"command-code", "cmd"})
+DEFAULT_COMMAND_CODE_MODEL = "deepseek/deepseek-v4.1-flash"
+
+
+def _command_code_model() -> str | None:
+    model = os.environ.get("COMMAND_CODE_MODEL", DEFAULT_COMMAND_CODE_MODEL).strip()
+    return model or None
+
 
 def _playwright_mcp_enabled() -> bool:
     value = os.environ.get("TELLY_PLAYWRIGHT_MCP", "1").strip().lower()
@@ -208,6 +217,27 @@ def _lock_for(thread_ts: str) -> threading.Lock:
         return lock
 
 
+def _build_command_code_cmd(agent_cmd: str, existing: str | None, message: str) -> list[str]:
+    # Command Code headless mode has no --append-system-prompt, so the telly
+    # system prompt is prepended to the user message (same approach as opencode).
+    prompt = f"{_system_prompt()}\n\nUser message from Slack:\n\n{message}"
+    cmd: list[str] = [
+        agent_cmd,
+        "-p",
+        "--output-format", "json",
+        "--yolo",
+        "--trust",
+        "--skip-onboarding",
+    ]
+    model = _command_code_model()
+    if model:
+        cmd += ["--model", model]
+    if existing:
+        cmd += ["--resume", existing]
+    cmd.append(prompt)
+    return cmd
+
+
 def _build_cmd(agent_cmd: str, thread_ts: str, message: str) -> list[str]:
     agent_name = Path(agent_cmd).name
     existing = _thread_sessions.get(thread_ts)
@@ -224,6 +254,9 @@ def _build_cmd(agent_cmd: str, thread_ts: str, message: str) -> list[str]:
             cmd += ["--session", existing]
         cmd.append(prompt)
         return cmd
+
+    if agent_name in COMMAND_CODE_NAMES:
+        return _build_command_code_cmd(agent_cmd, existing, message)
 
     cmd = [
         agent_cmd,
@@ -285,9 +318,55 @@ def _first_present(*values: object) -> object | None:
     return None
 
 
-def _parse_event(event: dict, state: dict) -> None:
-    """Mutate state based on one JSON event from Claude or OpenCode."""
+def _tool_event_for(state: dict, tool_id: object) -> dict | None:
+    for te in state["tool_events"]:
+        if te.get("id") == tool_id:
+            return te
+    return None
+
+
+def _apply_command_code_tool_event(event: dict, state: dict) -> None:
+    """Track one Command Code tool_* AgentEvent in the shared tool-event list."""
     etype = event.get("type")
+    tool_id = event.get("toolCallId")
+    name = str(event.get("toolName") or "tool")
+
+    if etype == "tool_queued":
+        tool_input = event.get("input") if isinstance(event.get("input"), dict) else {}
+        te = {"id": tool_id, "name": name, "input": tool_input, "status": "pending"}
+        state["tool_events"].append(te)
+        state["tool_breadcrumbs"].append({"name": name, "input": tool_input})
+        return
+
+    te = _tool_event_for(state, tool_id)
+    if te is None:
+        description = event.get("description")
+        tool_input: dict = (
+            {"description": description.strip()}
+            if isinstance(description, str) and description.strip()
+            else {}
+        )
+        te = {"id": tool_id, "name": name, "input": tool_input, "status": "running"}
+        state["tool_events"].append(te)
+        state["tool_breadcrumbs"].append({"name": name, "input": tool_input})
+
+    if etype == "tool_completed":
+        te["status"] = "done"
+    elif etype in ("tool_errored", "tool_denied"):
+        te["status"] = "error"
+    else:  # tool_running
+        te["status"] = "running"
+
+
+def _parse_event(event: dict, state: dict) -> None:
+    """Mutate state based on one JSON event from Claude, OpenCode, or Command Code."""
+    etype = event.get("type")
+
+    # Command Code headless wraps each AgentEvent as {"type":"event","event":{...}}.
+    if etype == "event" and isinstance(event.get("event"), dict):
+        _parse_event(event["event"], state)
+        return
+
     part = event.get("part") if isinstance(event.get("part"), dict) else {}
 
     if etype == "system" and event.get("subtype") == "init":
@@ -299,6 +378,16 @@ def _parse_event(event: dict, state: dict) -> None:
         if text.strip():
             state["assistant_texts"].append(text.strip())
             state["partial_text"] = "\n\n".join(state["assistant_texts"]).strip()
+
+    if etype == "text_delta":
+        delta = str(event.get("delta") or "")
+        if delta:
+            state["delta_texts"].append(delta)
+            state["partial_text"] = "".join(state["delta_texts"]).strip()
+
+    if etype in ("tool_queued", "tool_running", "tool_completed", "tool_errored", "tool_denied"):
+        _apply_command_code_tool_event(event, state)
+        return
 
     if etype == "assistant":
         msg = event.get("message") or {}
@@ -329,10 +418,16 @@ def _parse_event(event: dict, state: dict) -> None:
                         break
 
     elif etype == "result":
-        state["reply"] = (event.get("result") or "").strip()
-        state["session_id"] = event.get("session_id") or state.get("session_id")
-        state["cost_usd"] = event.get("total_cost_usd")
-        state["duration_ms"] = event.get("duration_ms")
+        state["reply"] = str(event.get("result") or event.get("finalText") or "").strip()
+        state["session_id"] = (
+            event.get("session_id") or event.get("sessionId") or state.get("session_id")
+        )
+        state["cost_usd"] = _first_present(
+            event.get("total_cost_usd"), event.get("cost_usd"), state.get("cost_usd")
+        )
+        state["duration_ms"] = _first_present(
+            event.get("duration_ms"), event.get("durationMs"), state.get("duration_ms")
+        )
         return
 
     state["session_id"] = (
@@ -376,6 +471,7 @@ def _new_parse_state(duration_ms: int = 0) -> dict:
         "tool_breadcrumbs": [],
         "tool_events": [],
         "assistant_texts": [],
+        "delta_texts": [],
         "partial_text": "",
     }
 
@@ -418,6 +514,8 @@ def _parse_output(stdout: str, duration_ms: int) -> dict:
 
     if not state["reply"] and state["assistant_texts"]:
         state["reply"] = "\n\n".join(state["assistant_texts"]).strip()
+    if not state["reply"] and state["delta_texts"]:
+        state["reply"] = "".join(state["delta_texts"]).strip()
     if not state["reply"] and not parsed_any:
         state["reply"] = stripped
     return state
