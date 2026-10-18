@@ -1,4 +1,4 @@
-# slack-tmux
+# telly
 
 Chat-facing coding agent that runs local coding CLIs in resumable tmux-backed sessions. Works on **Slack** and **Telegram** — run either or both at once.
 
